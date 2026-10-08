@@ -26,6 +26,10 @@ class TokenState(Base):
     price = Column(Numeric(precision=30, scale=18), nullable=False)
     value = Column(Numeric(precision=30, scale=18), nullable=False)
     available_units = Column(Numeric(precision=30, scale=18), nullable=False)
+    # Nullable for historical snapshots collected before equity was recorded,
+    # and for connectors that only expose wallet balances.
+    unrealized_pnl = Column(Numeric(precision=30, scale=18), nullable=True)
+    equity_value = Column(Numeric(precision=30, scale=18), nullable=True)
 
     account_state = relationship("AccountState", back_populates="token_states")
 

@@ -28,6 +28,10 @@ def patched_save_to_yml(yml_path, cm):
 
 config_helpers.save_to_yml = patched_save_to_yml
 
+from utils.client_order_ids import install_client_order_id_compatibility  # noqa: E402
+
+install_client_order_id_compatibility()
+
 from fastapi import Depends, FastAPI, HTTPException, status  # noqa: E402
 from fastapi.exceptions import RequestValidationError  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402

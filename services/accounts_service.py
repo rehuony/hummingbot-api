@@ -228,10 +228,9 @@ class AccountsService:
         Combines the connector state refresh and token info retrieval into a
         single awaitable so both can run in parallel across all connectors.
         """
-        try:
-            await self._connector_service.refresh_connector_state(connector, connector_name, account_name)
-        except Exception as e:
-            logger.error(f"Error refreshing {connector_name}, using stale data: {e}")
+        await self._connector_service.refresh_connector_state(
+            connector, connector_name, account_name, strict=True
+        )
         # skip_balance_refresh=True since refresh_connector_state already called _update_balances
         return await self._get_connector_tokens_info(connector, connector_name, skip_balance_refresh=True)
 
@@ -267,18 +266,16 @@ class AccountsService:
                 tasks.append(self._update_gateway_balances())
                 results = await asyncio.gather(*tasks, return_exceptions=True)
 
+                # Never publish/persist a mixture of fresh and failed balances:
+                # a transfer can otherwise exist on both sides of the snapshot.
+                for result in results:
+                    if isinstance(result, Exception):
+                        raise RuntimeError("Incomplete portfolio refresh") from result
+
                 # Process connector results (last result is always gateway)
                 connector_results = results[:-1] if has_connector_tasks else []
                 for (account_name, connector_name), result in zip(task_meta, connector_results):
-                    if isinstance(result, Exception):
-                        logger.error(f"Error updating {connector_name} in {account_name}: {result}")
-                        self.accounts_state[account_name][connector_name] = []
-                    else:
-                        self.accounts_state[account_name][connector_name] = result
-
-                gw_result = results[-1]
-                if isinstance(gw_result, Exception):
-                    logger.error(f"Error updating gateway balances: {gw_result}")
+                    self.accounts_state[account_name][connector_name] = result
 
                 self._mirror_gateway_state_to_accounts(gateway_meta)
 
@@ -327,7 +324,7 @@ class AccountsService:
                 # after all rows are added (one transaction per snapshot).
                 for account_name, connectors in accounts_state_snapshot.items():
                     for connector_name, tokens_info in connectors.items():
-                        if tokens_info:  # Only save if there's token data
+                        if tokens_info is not None:  # An empty wallet is a real zero snapshot
                             await repository.save_account_state(account_name, connector_name, tokens_info, snapshot_timestamp)
 
         except Exception as e:
@@ -450,15 +447,19 @@ class AccountsService:
                 return_exceptions=True
             )
             # Remove gateway result from processing (it handles its own state internally)
+            if isinstance(results[-1], Exception):
+                raise HTTPException(status_code=502, detail="Failed to refresh wallet balances")
             results = results[:-1]
+
+        # Validate the entire batch before replacing any CEX balance. Retain
+        # the previous snapshot on failure; do not turn an error into zero.
+        for result in results:
+            if isinstance(result, Exception):
+                raise HTTPException(status_code=502, detail="Failed to refresh exchange balances") from result
 
         # Process results
         for (account_name, connector_name), result in zip(task_meta, results):
-            if isinstance(result, Exception):
-                logger.error(f"Error updating balances for connector {connector_name} in account {account_name}: {result}")
-                self.accounts_state[account_name][connector_name] = []
-            else:
-                self.accounts_state[account_name][connector_name] = result
+            self.accounts_state[account_name][connector_name] = result
 
         if not skip_gateway:
             self._mirror_gateway_state_to_accounts(gateway_meta)
@@ -494,13 +495,29 @@ class AccountsService:
         """
         # Fetch fresh balances from the exchange unless caller already did
         if not skip_balance_refresh and hasattr(connector, '_update_balances'):
-            try:
-                await connector._update_balances()
-            except Exception as e:
-                logger.warning(f"Failed to refresh balances for {connector_name}, using cached data: {e}")
+            await connector._update_balances()
 
-        balances = [{"token": key, "units": value} for key, value in connector.get_all_balances().items() if
-                    value != Decimal("0") and key not in settings.banned_tokens]
+        if connector_name in {"binance_perpetual", "binance_perpetual_testnet"}:
+            # Hummingbot's Binance balance cache contains walletBalance only.
+            # Read wallet, available balance and unrealized PnL from ONE account
+            # response, including manual positions and both hedge-mode sides.
+            from hummingbot.connector.derivative.binance_perpetual import binance_perpetual_constants
+
+            account = await connector._api_get(
+                path_url=binance_perpetual_constants.ACCOUNT_INFO_URL,
+                is_auth_required=True,
+            )
+            balances = [
+                {"token": asset["asset"], "units": Decimal(asset["walletBalance"]),
+                 "available_units": Decimal(asset["availableBalance"]),
+                 "unrealized_pnl": Decimal(asset["unrealizedProfit"])}
+                for asset in account["assets"]
+                if asset["asset"] not in settings.banned_tokens
+                and (Decimal(asset["walletBalance"]) != 0 or Decimal(asset["unrealizedProfit"]) != 0)
+            ]
+        else:
+            balances = [{"token": key, "units": value} for key, value in connector.get_all_balances().items() if
+                        value != Decimal("0") and key not in settings.banned_tokens]
 
         tokens_info = []
         missing_pairs = []  # trading pairs the oracle can't price
@@ -530,7 +547,8 @@ class AccountsService:
                 token,
                 balance["units"],
                 price,
-                available_units=connector.get_available_balance(token),
+                available_units=(balance["available_units"] if "available_units" in balance
+                                 else connector.get_available_balance(token)),
             ))
 
         # Batch-fetch only the missing prices from the exchange
@@ -542,6 +560,12 @@ class AccountsService:
                 tokens_info[info_idx]["price"] = float(price)
                 tokens_info[info_idx]["value"] = float(price * Decimal(str(tokens_info[info_idx]["units"])))
 
+        for info, balance in zip(tokens_info, balances):
+            if "unrealized_pnl" in balance:
+                info["unrealized_pnl"] = float(balance["unrealized_pnl"])
+                info["equity_value"] = float(
+                    (balance["units"] + balance["unrealized_pnl"]) * Decimal(str(info["price"]))
+                )
         return tokens_info
     
     async def _safe_get_last_traded_prices(self, connector, trading_pairs, timeout=10):

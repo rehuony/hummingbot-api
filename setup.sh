@@ -793,6 +793,10 @@ TAILSCALE_HOSTNAME=$TAILSCALE_HOSTNAME
 #MARKET_DATA_FEED_TIMEOUT=600
 # How long to wait for a candle feed to become ready, in seconds.
 #MARKET_DATA_CANDLES_READY_TIMEOUT=30
+# REST historical ranges: shared cache with a strict freshness and entry bound
+#MARKET_DATA_HISTORICAL_CACHE_PATH=data/market_candles
+#MARKET_DATA_HISTORICAL_CACHE_ENTRIES=128
+#MARKET_DATA_HISTORICAL_CACHE_TTL_SECONDS=15.0
 # WebSocket heartbeat interval, in seconds.
 #MARKET_DATA_WS_HEARTBEAT_INTERVAL=30
 # Allowed range for a market-data WebSocket subscription update interval, in seconds.

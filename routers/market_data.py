@@ -34,6 +34,7 @@ from models import (
     VWAPForVolumeRequest,
 )
 from models.market_data import CandlesConfigRequest
+from services.binance_rate_limits import BinanceRateLimitError
 from services.market_data_service import MarketDataService
 from services.ticker_sources import TickerFetchError, TickerUnsupportedError
 from services.unified_connector_service import UnknownConnectorError
@@ -115,6 +116,10 @@ async def get_candles(request: Request, candles_config: CandlesConfigRequest):
 
     except HTTPException:
         raise
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Candle feed validation timed out")
+    except BinanceRateLimitError as e:
+        raise HTTPException(status_code=429, detail=str(e), headers={"Retry-After": str(e.retry_after)}) from e
     except UnsupportedConnectorException as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -151,24 +156,7 @@ async def get_historical_candles(request: Request, config: HistoricalCandlesConf
     try:
         market_data_service: MarketDataService = request.app.state.market_data_service
 
-        candles_config = CandlesConfig(
-            connector=config.connector_name,
-            trading_pair=config.trading_pair,
-            interval=config.interval
-        )
-
-        # Creating the feed validates the trading pair on first use (cache hit afterwards);
-        # an invalid pair raises ValueError.
-        try:
-            candles = await market_data_service.get_candles_feed(candles_config)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-
-        timeout = settings.market_data.candles_ready_timeout
-        historical_data = await asyncio.wait_for(
-            candles.get_historical_candles(config=config),
-            timeout=timeout
-        )
+        historical_data = await market_data_service.get_historical_candles(config)
 
         if historical_data is not None and not historical_data.empty:
             return historical_data.to_dict(orient="records")
@@ -185,6 +173,8 @@ async def get_historical_candles(request: Request, config: HistoricalCandlesConf
                    f"{settings.market_data.candles_ready_timeout}s. "
                    f"The trading pair may not exist or the time range may be too large."
         )
+    except BinanceRateLimitError as e:
+        raise HTTPException(status_code=429, detail=str(e), headers={"Retry-After": str(e.retry_after)}) from e
     except UnsupportedConnectorException as e:
         raise HTTPException(status_code=400, detail=str(e))
     except ValueError as e:

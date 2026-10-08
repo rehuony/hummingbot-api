@@ -22,6 +22,10 @@ class FakeCandleFeed:
     """Candle feed stand-in whose validation yields to the loop, exposing the race window."""
 
     def __init__(self, config: CandlesConfig):
+        from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
+        from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
+
+        self._api_factory = WebAssistantsFactory(AsyncThrottler([]))
         self.config = config
         self.started = False
         self.stopped = False
@@ -60,6 +64,7 @@ class FakeCandlesFactory:
 def factory(monkeypatch):
     fake = FakeCandlesFactory()
     monkeypatch.setattr("services.market_data_service.CandlesFactory", fake)
+    monkeypatch.setattr("services.market_data_service.create_candle_feed", fake.get_candle)
     return fake
 
 
@@ -172,3 +177,33 @@ async def test_a_held_lock_survives_pruning(service, factory):
 
     service._discard_candle_feed_lock(feed_key)
     assert feed_key not in service._candle_feed_locks
+
+
+async def test_validation_timeout_closes_the_unregistered_feed(service, factory, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from config import settings
+
+    async def blocked_validation(*args):
+        await asyncio.Event().wait()
+
+    feed = factory.get_candle(CONFIG)
+    feed._api_factory.close = AsyncMock()
+    monkeypatch.setattr("services.market_data_service.create_candle_feed", lambda config: feed)
+    monkeypatch.setattr(service, "_validate_pair", blocked_validation)
+    monkeypatch.setattr(settings.market_data, "candles_ready_timeout", 0.02)
+    with pytest.raises(asyncio.TimeoutError):
+        await service.get_candles_feed(CONFIG)
+    feed._api_factory.close.assert_awaited_once()
+    assert not feed.started
+    assert service._candle_feeds == {}
+
+
+async def test_banned_live_feed_creation_fails_before_creating_a_feed(service, factory):
+    from services.binance_rate_limits import BinanceRateLimitError, BinanceRequestBudget
+
+    budget = service._binance_rate_limits._budgets["binance"] = BinanceRequestBudget(960, 60)
+    budget.block(120, 418)
+    with pytest.raises(BinanceRateLimitError):
+        await service.get_candles_feed(CONFIG)
+    assert factory.created == []

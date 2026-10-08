@@ -16,6 +16,8 @@ class TokenBalance(BaseModel):
     price: float = Field(description="Current price per unit")
     value: float = Field(description="Total value (units * price)")
     available_units: float = Field(description="Available units (not locked in orders)")
+    unrealized_pnl: Optional[float] = Field(default=None, description="Unrealized PnL in this asset's units; null when not recorded")
+    equity_value: Optional[float] = Field(default=None, description="Wallet value plus unrealized PnL, priced in USD; null when not recorded")
 
 
 class ConnectorBalances(BaseModel):

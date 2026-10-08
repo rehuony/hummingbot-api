@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -37,7 +37,11 @@ async def get_portfolio_state(
             connector_names=filter_request.connector_names
         )
 
-    all_states = accounts_service.get_accounts_state()
+    # Filtering a response must not delete connectors from the live cache.
+    all_states = {
+        name: dict(connectors)
+        for name, connectors in accounts_service.get_accounts_state().items()
+    }
 
     # Apply account name filter first
     if filter_request.account_names:
@@ -89,8 +93,8 @@ async def get_portfolio_history(
     """
     try:
         # Convert integer timestamps to datetime objects
-        start_time_dt = datetime.fromtimestamp(filter_request.start_time / 1000) if filter_request.start_time else None
-        end_time_dt = datetime.fromtimestamp(filter_request.end_time / 1000) if filter_request.end_time else None
+        start_time_dt = datetime.fromtimestamp(filter_request.start_time / 1000, timezone.utc) if filter_request.start_time is not None else None
+        end_time_dt = datetime.fromtimestamp(filter_request.end_time / 1000, timezone.utc) if filter_request.end_time is not None else None
 
         # Single query handles both all-accounts and filtered-accounts cases (IN filter),
         # returning data ordered by timestamp desc with a consistent pagination cursor.

@@ -84,17 +84,14 @@ class TestBalanceRefresh:
         mock_connector._update_balances.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_balance_failure_preserves_stale_data(self, accounts_service, mock_connector):
-        """_update_balances failure should preserve stale cached data."""
+    async def test_balance_failure_is_not_reported_as_a_fresh_snapshot(self, accounts_service, mock_connector):
+        """A failed read must not create a plausible but stale balance snapshot."""
         mock_connector._update_balances = AsyncMock(side_effect=Exception("API error"))
         mock_connector.get_all_balances.return_value = {"USDT": Decimal("500")}
 
-        result = await accounts_service._get_connector_tokens_info(mock_connector, "okx")
-
-        # Should still return data from get_all_balances (stale cache)
-        assert len(result) == 1
-        assert result[0]["token"] == "USDT"
-        assert result[0]["units"] == 500.0
+        with pytest.raises(Exception, match="API error"):
+            await accounts_service._get_connector_tokens_info(mock_connector, "okx")
+        mock_connector.get_all_balances.assert_not_called()
 
 
 class TestGatewayWalletState:

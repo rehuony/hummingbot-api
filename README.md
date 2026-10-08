@@ -199,6 +199,40 @@ lines showing their defaults, so you can see and override them without leaving t
 
 Edit `.env` and restart with `make deploy` to apply changes.
 
+### Historical market data and Binance request limits
+
+Use `/market-data/historical-candles` for scans and research. It downloads REST pages
+without starting a live candle feed. Concurrent requests for the same market and
+interval-aligned window share one download; each response is trimmed to its requested
+start/end timestamps. At most four historical downloads run concurrently. The disk cache
+defaults to 128 ranges with a 15-second freshness bound, including forming candles:
+
+```bash
+#MARKET_DATA_HISTORICAL_CACHE_PATH=data/market_candles
+#MARKET_DATA_HISTORICAL_CACHE_ENTRIES=128
+#MARKET_DATA_HISTORICAL_CACHE_TTL_SECONDS=15.0
+```
+
+Set entries to zero to disable the cache. Failed or empty downloads are not cached.
+Live `/market-data/candles` requests continue to use managed WebSocket feeds.
+
+API-owned Binance connectors and candle feeds share a request-weight budget across
+accounts, separately for spot, USD-M futures and test/US domains. The budget uses 80%
+of the connector's configured IP allowance and retains its existing order throttles.
+Futures candle pages use at most 499 rows (weight 2); requests below 100 rows use weight 1.
+The adapter preserves the historical endpoint's inclusive end timestamp across pages.
+See Binance's [USD-M market data documentation](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data).
+
+HTTP 418/429 pauses the shared budget using `Retry-After` or the reported ban expiry.
+Background REST requests wait; historical callers receive HTTP 429 with `Retry-After`.
+High `X-MBX-USED-WEIGHT-1M` usage also pauses new requests. Do not immediately retry
+against the live-candles endpoint: it uses the same IP allowance.
+
+This coordination is scoped to one API process. Independent bots, backtest workers and
+scripts using Binance directly still consume the same egress IP's allowance; they must
+budget their own traffic or request historical data through this API. Successful response
+headers provide a brake for external usage, not a distributed reservation system.
+
 ## Secure Connection via Tailscale
 
 [Tailscale](https://tailscale.com) creates a private WireGuard network (tailnet) that makes the API accessible only to devices on your tailnet — no open ports, no firewall rules needed.

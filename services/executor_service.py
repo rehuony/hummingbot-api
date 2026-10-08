@@ -1117,6 +1117,44 @@ class ExecutorService:
             "keep_position": keep_position
         }
 
+    async def delete_executor(self, executor_id: str) -> Dict[str, Any]:
+        """Permanently delete a finished executor's history; never trade or clear holds."""
+        # Metadata outlives the active entry while completion is being persisted.
+        # Refuse that window too, otherwise completion could recreate a deleted row.
+        if executor_id in self._active_executors or executor_id in self._executor_metadata:
+            raise HTTPException(status_code=409, detail="Executor is running or still completing")
+        if not self.db_manager:
+            raise HTTPException(status_code=503, detail="Executor history database unavailable")
+
+        async with self.db_manager.get_session_context() as session:
+            repo = ExecutorRepository(session)
+            record = await repo.get_executor_by_id(executor_id, for_update=True)
+            if record is None:
+                raise HTTPException(status_code=404, detail=f"Executor {executor_id} not found")
+            if record.status != "TERMINATED":
+                raise HTTPException(status_code=409, detail="Only TERMINATED executor history can be deleted")
+            if executor_id in self._active_executors or executor_id in self._executor_metadata:
+                raise HTTPException(status_code=409, detail="Executor is running or still completing")
+
+            if record.executor_type == "lp_executor":
+                try:
+                    final_state = json.loads(record.final_state or "{}")
+                    if not isinstance(final_state, dict):
+                        raise ValueError("Invalid final state")
+                except (ValueError, TypeError):
+                    raise HTTPException(status_code=409, detail="LP final state needs reconciliation before deletion")
+                if not final_state.get("orphan_resolved") and (
+                    record.close_type == "SYSTEM_CLEANUP"
+                    or final_state.get("position_address")
+                    or final_state.get("orphaned_position")
+                    or final_state.get("hold_reason")
+                ):
+                    raise HTTPException(status_code=409, detail="Resolve the orphaned LP position before deleting its history")
+
+            await repo.delete_executor(executor_id)
+
+        return {"executor_id": executor_id, "deleted": True}
+
     async def get_orphaned_positions(self) -> List[Dict[str, Any]]:
         """
         List executors that terminated while potentially still owning an on-chain position.
