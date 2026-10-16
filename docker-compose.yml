@@ -119,12 +119,8 @@ services:
       - postgres-data:/var/lib/postgresql/data
       # Init script as safety net - only runs on first initialization
       - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
-    # Loopback-only: only the hummingbot-api container talks to postgres,
-    # and it does so over the emqx-bridge docker network, not this port.
-    ports:
-      # SEC: loopback by default. Only `make run` (source mode, uvicorn on the host) needs
-      # this published at all; the containerised API reaches Postgres in-network.
-      - "${DB_BIND:-127.0.0.1}:5432:5432"
+    # The containerised API reaches Postgres over emqx-bridge. Only `make run`
+    # publishes a host port, through docker-compose.source.yml.
     networks:
       - emqx-bridge
     healthcheck:

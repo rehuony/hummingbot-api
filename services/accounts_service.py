@@ -11,7 +11,7 @@ from hummingbot.core.data_type.common import OrderType, PositionAction, Position
 
 from config import settings
 from database import AccountRepository, AsyncDatabaseManager
-from services.gateway_client import GatewayClient
+from services.gateway_client import GatewayClient, check_gateway_error
 from services.gateway_transaction_poller import GatewayTransactionPoller
 from services.gateway_wallet_service import GatewayWalletService, balance_entry
 from services.perpetual_trading_service import PerpetualTradingService
@@ -228,10 +228,9 @@ class AccountsService:
         Combines the connector state refresh and token info retrieval into a
         single awaitable so both can run in parallel across all connectors.
         """
-        try:
-            await self._connector_service.refresh_connector_state(connector, connector_name, account_name)
-        except Exception as e:
-            logger.error(f"Error refreshing {connector_name}, using stale data: {e}")
+        await self._connector_service.refresh_connector_state(
+            connector, connector_name, account_name, strict=True
+        )
         # skip_balance_refresh=True since refresh_connector_state already called _update_balances
         return await self._get_connector_tokens_info(connector, connector_name, skip_balance_refresh=True)
 
@@ -252,41 +251,37 @@ class AccountsService:
                 gateway_meta = []  # (account_name, connector_name) of Gateway connectors
 
                 for account_name, connectors in all_connectors.items():
-                    if account_name not in self.accounts_state:
-                        self.accounts_state[account_name] = {}
                     for connector_name, connector in connectors.items():
                         # Gateway connectors only track the tokens of their trading pairs; the
-                        # full wallet balance is fetched by _update_gateway_balances below.
+                        # full wallet balance is fetched separately below.
                         if self._connector_service.is_gateway_connector(connector):
                             gateway_meta.append((account_name, connector_name))
                             continue
                         tasks.append(self._refresh_and_get_tokens_info(connector, connector_name, account_name))
                         task_meta.append((account_name, connector_name))
 
-                has_connector_tasks = len(tasks) > 0
-                tasks.append(self._update_gateway_balances())
+                tasks.append(self._fetch_gateway_balances(required=bool(gateway_meta)))
                 results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                # Process connector results (last result is always gateway)
-                connector_results = results[:-1] if has_connector_tasks else []
-                for (account_name, connector_name), result in zip(task_meta, connector_results):
+                # Never publish/persist a mixture of fresh and failed balances:
+                # a transfer can otherwise exist on both sides of the snapshot.
+                for result in results:
+                    if isinstance(result, asyncio.CancelledError):
+                        raise result
                     if isinstance(result, Exception):
-                        logger.error(f"Error updating {connector_name} in {account_name}: {result}")
-                        self.accounts_state[account_name][connector_name] = []
-                    else:
-                        self.accounts_state[account_name][connector_name] = result
+                        raise RuntimeError("Incomplete portfolio refresh") from result
 
-                gw_result = results[-1]
-                if isinstance(gw_result, Exception):
-                    logger.error(f"Error updating gateway balances: {gw_result}")
+                # Process connector results (last result is always gateway)
+                connector_results = results[:-1]
+                for (account_name, connector_name), result in zip(task_meta, connector_results):
+                    self.accounts_state.setdefault(account_name, {})[connector_name] = result
 
-                self._mirror_gateway_state_to_accounts(gateway_meta)
+                self._apply_gateway_balances(results[-1], gateway_meta)
 
                 await self.dump_account_state()
             except Exception as e:
                 logger.error(f"Error updating account state: {e}")
-            finally:
-                await asyncio.sleep(self.update_account_state_interval)
+            await asyncio.sleep(self.update_account_state_interval)
 
     async def order_status_polling_loop(self):
         """
@@ -327,7 +322,7 @@ class AccountsService:
                 # after all rows are added (one transaction per snapshot).
                 for account_name, connectors in accounts_state_snapshot.items():
                     for connector_name, tokens_info in connectors.items():
-                        if tokens_info:  # Only save if there's token data
+                        if tokens_info is not None:  # An empty wallet is a real zero snapshot
                             await repository.save_account_state(account_name, connector_name, tokens_info, snapshot_timestamp)
 
         except Exception as e:
@@ -368,8 +363,8 @@ class AccountsService:
                 )
         except Exception as e:
             logger.error(f"Error loading account state history from database: {e}")
-            # Return empty result since we no longer have a fallback
-            return [], None, False
+            # An unavailable history is not evidence that no snapshots exist.
+            raise
 
     async def check_all_connectors(self):
         """
@@ -422,15 +417,13 @@ class AccountsService:
             if account_names and account_name not in account_names:
                 continue
 
-            if account_name not in self.accounts_state:
-                self.accounts_state[account_name] = {}
             for connector_name, connector in connectors.items():
                 # Filter by connector_names if specified
                 if connector_names and connector_name not in connector_names:
                     continue
 
                 # Gateway connectors only track the tokens of their trading pairs; the full
-                # wallet balance is fetched by _update_gateway_balances below. Running both
+                # wallet balance is fetched separately below. Running both
                 # would overwrite the complete wallet state with the narrower connector view.
                 if self._connector_service.is_gateway_connector(connector):
                     gateway_meta.append((account_name, connector_name))
@@ -446,39 +439,53 @@ class AccountsService:
             # Pass connector_names filter to gateway for chain-network filtering
             results = await asyncio.gather(
                 *tasks,
-                self._update_gateway_balances(chain_networks=connector_names),
+                self._fetch_gateway_balances(chain_networks=connector_names, required=bool(gateway_meta)),
                 return_exceptions=True
             )
-            # Remove gateway result from processing (it handles its own state internally)
+            # Retain the staged Gateway update until the CEX batch also succeeds.
+            if isinstance(results[-1], asyncio.CancelledError):
+                raise results[-1]
+            if isinstance(results[-1], Exception):
+                raise HTTPException(status_code=502, detail="Failed to refresh wallet balances")
+            gateway_updates = results[-1]
             results = results[:-1]
+
+        # Validate the entire batch before replacing any CEX balance. Retain
+        # the previous snapshot on failure; do not turn an error into zero.
+        for result in results:
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            if isinstance(result, Exception):
+                raise HTTPException(status_code=502, detail="Failed to refresh exchange balances") from result
 
         # Process results
         for (account_name, connector_name), result in zip(task_meta, results):
-            if isinstance(result, Exception):
-                logger.error(f"Error updating balances for connector {connector_name} in account {account_name}: {result}")
-                self.accounts_state[account_name][connector_name] = []
-            else:
-                self.accounts_state[account_name][connector_name] = result
+            self.accounts_state.setdefault(account_name, {})[connector_name] = result
 
         if not skip_gateway:
-            self._mirror_gateway_state_to_accounts(gateway_meta)
+            self._apply_gateway_balances(gateway_updates, gateway_meta)
 
-    def _mirror_gateway_state_to_accounts(self, gateway_meta: List[tuple]):
-        """Mirror Gateway wallet balances onto non-master accounts holding the same connector.
+    def _apply_gateway_balances(self, updates: Dict[str, Optional[List[Dict]]], gateway_meta: List[tuple]):
+        """Commit a successful Gateway read and mirror it to configured accounts.
 
-        _update_gateway_balances stores the full wallet balances under master_account. A
-        Gateway connector configured on another account trades the same Gateway default
-        wallet, so it reports the same balances.
-
-        Args:
-            gateway_meta: (account_name, connector_name) pairs of Gateway connectors.
+        None removes an unconfigured network; [] records a successfully read empty wallet.
+        Called synchronously only after the whole balance refresh succeeds.
         """
+        if updates:
+            master_state = self.accounts_state.setdefault("master_account", {})
+            for connector_name, balances in updates.items():
+                if balances is None:
+                    master_state.pop(connector_name, None)
+                else:
+                    master_state[connector_name] = balances
         master_state = self.accounts_state.get("master_account", {})
         for account_name, connector_name in gateway_meta:
             if account_name == "master_account":
                 continue
             if connector_name in master_state:
-                self.accounts_state[account_name][connector_name] = master_state[connector_name]
+                self.accounts_state.setdefault(account_name, {})[connector_name] = master_state[connector_name]
+            elif connector_name in updates:
+                self.accounts_state.get(account_name, {}).pop(connector_name, None)
 
     async def _get_connector_tokens_info(self, connector, connector_name: str, skip_balance_refresh: bool = False) -> List[Dict]:
         """Get token info from a connector instance using the ticker pool prices.
@@ -492,15 +499,31 @@ class AccountsService:
             connector_name: Name of the connector
             skip_balance_refresh: If True, skip fetching fresh balances (use when caller already refreshed)
         """
-        # Fetch fresh balances from the exchange unless caller already did
-        if not skip_balance_refresh and hasattr(connector, '_update_balances'):
-            try:
-                await connector._update_balances()
-            except Exception as e:
-                logger.warning(f"Failed to refresh balances for {connector_name}, using cached data: {e}")
+        if connector_name in {"binance_perpetual", "binance_perpetual_testnet"}:
+            # Hummingbot's Binance balance cache contains walletBalance only.
+            # Read wallet, available balance and unrealized PnL from ONE account
+            # response, including manual positions and both hedge-mode sides.
+            from hummingbot.connector.derivative.binance_perpetual import binance_perpetual_constants
 
-        balances = [{"token": key, "units": value} for key, value in connector.get_all_balances().items() if
-                    value != Decimal("0") and key not in settings.banned_tokens]
+            account = await connector._api_get(
+                path_url=binance_perpetual_constants.ACCOUNT_INFO_URL,
+                is_auth_required=True,
+            )
+            balances = [
+                {"token": asset["asset"], "units": Decimal(asset["walletBalance"]),
+                 "available_units": Decimal(asset["availableBalance"]),
+                 "unrealized_pnl": Decimal(asset["unrealizedProfit"])}
+                for asset in account["assets"]
+                if asset["asset"] not in settings.banned_tokens
+                and (Decimal(asset["walletBalance"]) != 0 or Decimal(asset["unrealizedProfit"]) != 0)
+            ]
+        else:
+            # Binance above already fetched a complete account response. Other
+            # connectors still need their native balance cache refreshed.
+            if not skip_balance_refresh and hasattr(connector, '_update_balances'):
+                await connector._update_balances()
+            balances = [{"token": key, "units": value} for key, value in connector.get_all_balances().items() if
+                        value != Decimal("0") and key not in settings.banned_tokens]
 
         tokens_info = []
         missing_pairs = []  # trading pairs the oracle can't price
@@ -530,7 +553,8 @@ class AccountsService:
                 token,
                 balance["units"],
                 price,
-                available_units=connector.get_available_balance(token),
+                available_units=(balance["available_units"] if "available_units" in balance
+                                 else connector.get_available_balance(token)),
             ))
 
         # Batch-fetch only the missing prices from the exchange
@@ -542,6 +566,12 @@ class AccountsService:
                 tokens_info[info_idx]["price"] = float(price)
                 tokens_info[info_idx]["value"] = float(price * Decimal(str(tokens_info[info_idx]["units"])))
 
+        for info, balance in zip(tokens_info, balances):
+            if "unrealized_pnl" in balance:
+                info["unrealized_pnl"] = float(balance["unrealized_pnl"])
+                info["equity_value"] = float(
+                    (balance["units"] + balance["unrealized_pnl"]) * Decimal(str(info["price"]))
+                )
         return tokens_info
     
     async def _safe_get_last_traded_prices(self, connector, trading_pairs, timeout=10):
@@ -562,6 +592,8 @@ class AccountsService:
 
         last_traded = {}
         for result in results:
+            if isinstance(result, asyncio.CancelledError):
+                raise result
             if isinstance(result, Exception):
                 logger.warning(f"Failed to get price for a pair: {result}")
                 continue
@@ -1088,8 +1120,10 @@ class AccountsService:
     # Gateway Wallet Management Methods
     # ============================================
 
-    async def _update_gateway_balances(self, chain_networks: Optional[List[str]] = None):
-        """Update Gateway wallet balances in master_account state.
+    async def _fetch_gateway_balances(
+        self, chain_networks: Optional[List[str]] = None, *, required: bool = False
+    ) -> Dict[str, Optional[List[Dict]]]:
+        """Read Gateway balances without mutating the published account snapshot.
 
         Only queries the defaultWallet on each network in defaultNetworks for each chain.
         This is more efficient than querying all wallets on all networks.
@@ -1098,27 +1132,32 @@ class AccountsService:
             chain_networks: If provided, only update these chain-network combinations
                            (e.g., ['solana-mainnet-beta', 'ethereum-mainnet']).
                            If None, update all defaultNetworks for each chain.
+            required: A configured Gateway connector requires a successful read.
         """
+        required = required or any(
+            "-" in name and (not chain_networks or name in chain_networks)
+            for connectors in self.accounts_state.values() for name in connectors
+        )
+        updates: Dict[str, Optional[List[Dict]]] = {}
+        if chain_networks and not required and not any("-" in name for name in chain_networks):
+            # An exchange-only filter has no Gateway networks to refresh.
+            return updates
         try:
             # Check if Gateway is available
             if not await self.gateway_client.ping():
+                if required:
+                    raise RuntimeError("Gateway wallet balances are unavailable")
                 logger.debug("Gateway service is not available, skipping wallet balance update")
-                return
+                return updates
 
             # Get all available chains
-            chains_result = await self.gateway_client.get_chains()
+            chains_result = check_gateway_error(await self.gateway_client.get_chains())
             if not chains_result or "chains" not in chains_result:
-                logger.error("Could not get chains from Gateway")
-                return
+                raise RuntimeError("Could not get chains from Gateway")
 
             known_chains = {c["chain"] for c in chains_result["chains"]}
 
-            # Ensure master_account exists in accounts_state
-            if "master_account" not in self.accounts_state:
-                self.accounts_state["master_account"] = {}
-
             # Collect all balance query tasks for parallel execution
-            balance_tasks = []
             task_metadata = []  # Store (chain, network, address) for each task
 
             # Fetch every chain's config concurrently first, instead of one HTTP round-trip
@@ -1145,15 +1184,14 @@ class AccountsService:
                 chain = chain_info["chain"]
                 first_network = chain_info["networks"][0]
 
-                # A chain whose get_config raised is skipped/logged, same as before
+                if isinstance(config, asyncio.CancelledError):
+                    raise config
                 if isinstance(config, Exception):
-                    logger.warning(f"Could not get config for '{chain}-{first_network}': {config}")
-                    continue
+                    raise RuntimeError(f"Could not get config for '{chain}-{first_network}'") from config
 
-                # A Gateway HTTP error dict would otherwise read as "missing defaultWallet" below
-                if config is None or set(config.keys()) == {"error", "status"}:
-                    logger.warning(f"Gateway error getting config for '{chain}-{first_network}': {config}")
-                    continue
+                # Reuse the Gateway parser, including HTTP errors carrying a
+                # machine-readable code, before treating a missing wallet as configuration.
+                config = check_gateway_error(config)
 
                 default_wallet = config.get("defaultWallet")
                 default_networks = config.get("defaultNetworks", [])
@@ -1184,30 +1222,30 @@ class AccountsService:
                     if chain_networks and chain_network_key not in chain_networks:
                         continue
 
-                    balance_tasks.append(self.get_gateway_balances(chain, default_wallet, network=network))
                     task_metadata.append((chain, network, default_wallet))
 
             # Build set of active chain-network keys
             active_chain_networks = {f"{chain}-{network}" for chain, network, _ in task_metadata}
 
             # Execute all balance queries in parallel
-            if balance_tasks:
-                results = await asyncio.gather(*balance_tasks, return_exceptions=True)
+            if task_metadata:
+                results = await asyncio.gather(
+                    *(self.get_gateway_balances(chain, address, network=network)
+                      for chain, network, address in task_metadata),
+                    return_exceptions=True,
+                )
 
                 # Process results
                 for result, (chain, network, address) in zip(results, task_metadata):
                     chain_network = f"{chain}-{network}"
 
+                    if isinstance(result, asyncio.CancelledError):
+                        raise result
                     if isinstance(result, Exception):
-                        logger.error(f"Error updating Gateway balances for {chain}-{network} wallet {address}: {result}")
-                        # Store empty list for error state
-                        self.accounts_state["master_account"][chain_network] = []
-                    elif result:
-                        # Only store if there are actual balances (non-empty list)
-                        self.accounts_state["master_account"][chain_network] = result
-                    else:
-                        # Store empty list to indicate we checked this network
-                        self.accounts_state["master_account"][chain_network] = []
+                        raise RuntimeError(f"Gateway balances are unavailable for '{chain_network}'") from result
+                    if not isinstance(result, list):
+                        raise RuntimeError(f"Invalid Gateway balances for '{chain_network}'")
+                    updates[chain_network] = result
 
             # Only remove stale keys if we're doing a full update (no filter)
             # When filtering, we don't want to remove keys that weren't in the filter
@@ -1215,7 +1253,7 @@ class AccountsService:
                 # Remove stale gateway chain-network keys (default network/wallet changed or no longer configured)
                 # Gateway keys follow pattern: chain-network (e.g., "solana-mainnet-beta", "ethereum-mainnet")
                 stale_keys = []
-                for key in self.accounts_state["master_account"]:
+                for key in self.accounts_state.get("master_account", {}):
                     # Check if key looks like a gateway chain-network (contains hyphen and matches chain pattern)
                     if "-" in key and key not in active_chain_networks:
                         # Verify it's a gateway key by checking if chain part matches known chains
@@ -1224,11 +1262,13 @@ class AccountsService:
                             stale_keys.append(key)
 
                 for key in stale_keys:
-                    logger.info(f"Removing stale Gateway balance data for {key} (no longer default network)")
-                    del self.accounts_state["master_account"][key]
+                    updates[key] = None
+
+            return updates
 
         except Exception as e:
             logger.error(f"Error updating Gateway balances: {e}")
+            raise
 
     async def get_gateway_wallets(self) -> List[Dict]:
         """

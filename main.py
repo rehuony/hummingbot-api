@@ -28,6 +28,10 @@ def patched_save_to_yml(yml_path, cm):
 
 config_helpers.save_to_yml = patched_save_to_yml
 
+from utils.client_order_ids import install_client_order_id_compatibility  # noqa: E402
+
+install_client_order_id_compatibility()
+
 from fastapi import Depends, FastAPI, HTTPException, status  # noqa: E402
 from fastapi.exceptions import RequestValidationError  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
@@ -80,6 +84,7 @@ from services.unified_connector_service import UnifiedConnectorService  # noqa: 
 from services.websocket_manager import WebSocketManager  # noqa: E402
 from utils.bot_archiver import BotArchiver  # noqa: E402
 from utils.core_compatibility import require_core_surface  # noqa: E402
+from utils.exchange_connections import exchange_connections  # noqa: E402
 from utils.security import BackendAPISecurity  # noqa: E402
 from utils.validation_errors import validation_exception_handler  # noqa: E402
 
@@ -102,6 +107,15 @@ security = HTTPBasic()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Configure the shared exchange transport before startup and release it only
+    # after services have drained their requests and WebSocket listener tasks.
+    async with exchange_connections():
+        async with _service_lifespan(app):
+            yield
+
+
+@asynccontextmanager
+async def _service_lifespan(app: FastAPI):
     """
     Lifespan context manager for the FastAPI application.
     Handles startup and shutdown events.
@@ -391,7 +405,7 @@ async def lifespan(app: FastAPI):
     await bots_orchestrator.stop()
     await accounts_service.stop()
     await executor_service.stop()
-    market_data_service.stop()
+    await market_data_service.stop()
     await connector_service.stop_all()
     GatewayHttpClient.get_instance().stop_monitor()
     docker_service.cleanup()

@@ -109,12 +109,14 @@ class TestGatewayConnectorFix:
         conn_setting = MagicMock()
         conn_setting.conn_init_parameters.return_value = {}
         service._conn_settings = {"binance": conn_setting}
+        service.binance_rate_limits = MagicMock()
+        exchange = MagicMock()
 
         with patch("services.unified_connector_service.BackendAPISecurity") as mock_security, \
                 patch("services.unified_connector_service.get_connector_class") as mock_class:
             mock_security.login_account = MagicMock()
             mock_security.api_keys = MagicMock(return_value={})
-            mock_class.return_value = MagicMock(return_value="binance-connector")
+            mock_class.return_value = MagicMock(return_value=exchange)
 
             connector = service._create_trading_connector(
                 account_name="master_account",
@@ -122,7 +124,9 @@ class TestGatewayConnectorFix:
             )
 
             assert not isinstance(connector, Gateway)
+            assert connector is exchange
             mock_class.assert_called_once_with("binance")
+            service.binance_rate_limits.install.assert_called_once_with("binance", exchange._web_assistants_factory)
 
 
 class TestScriptConfigFix:

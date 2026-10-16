@@ -59,6 +59,14 @@ class AsyncDatabaseManager:
     async def _run_migrations(self, conn):
         """Run lightweight schema migrations for existing tables."""
         migrations = [
+            (
+                "token_states", "unrealized_pnl",
+                "ALTER TABLE token_states ADD COLUMN unrealized_pnl NUMERIC(30,18)"
+            ),
+            (
+                "token_states", "equity_value",
+                "ALTER TABLE token_states ADD COLUMN equity_value NUMERIC(30,18)"
+            ),
             # Add controller_id to executors table (default "main" for existing rows)
             (
                 "executors", "controller_id",

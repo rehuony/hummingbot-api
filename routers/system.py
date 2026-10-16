@@ -110,9 +110,9 @@ async def get_system_info(docker_service: DockerService = Depends(get_docker_ser
         # The MARKET_DATA_* knobs as this process resolved them. Reported rather than
         # editable: they come from the env_file, which is not mounted into the
         # container, so the API cannot write its own .env -- a dashboard shows them and
-        # says where to change them. Non-secret by construction (MarketDataSettings
-        # holds only intervals and timeouts).
-        "market_data": settings.market_data.model_dump(),
+        # says where to change them. Keep the numeric tuning contract; the cache's
+        # filesystem location is local deployment configuration, not a dashboard knob.
+        "market_data": settings.market_data.model_dump(exclude={"historical_cache_path"}),
         "docker_available": False,
         "container": None,
         # None rather than False: without the daemon we have not established that the

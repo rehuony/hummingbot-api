@@ -28,6 +28,7 @@ from hummingbot.core.data_type.common import OrderType, PositionAction, TradeTyp
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
 from hummingbot.core.utils.async_utils import safe_ensure_future
 
+from services.binance_rate_limits import BINANCE_CONNECTORS, BinanceRateLimits
 from services.perpetual_trading_service import sync_position_mode
 from utils.file_system import fs_util
 from utils.hummingbot_api_config_adapter import HummingbotAPIConfigAdapter
@@ -67,6 +68,7 @@ class UnifiedConnectorService:
         self._trading_connectors: Dict[str, Dict[str, ConnectorBase]] = {}
 
         # Data-only connectors: connector_name -> ConnectorBase (shared, non-authenticated)
+        self.binance_rate_limits = BinanceRateLimits()
         self._data_connectors: Dict[str, ConnectorBase] = {}
         self._data_connectors_started: Dict[str, bool] = {}
 
@@ -765,7 +767,9 @@ class UnifiedConnectorService:
         )
 
         connector_class = get_connector_class(connector_name)
-        return connector_class(**init_params)
+        connector = connector_class(**init_params)
+        self._install_binance_policy(connector_name, connector)
+        return connector
 
     def _create_data_connector(self, connector_name: str) -> ConnectorBase:
         """Create a non-authenticated data connector."""
@@ -796,9 +800,14 @@ class UnifiedConnectorService:
 
         connector_class = get_connector_class(connector_name)
         connector = connector_class(**init_params)
+        self._install_binance_policy(connector_name, connector)
 
         logger.info(f"Created data connector: {connector_name}")
         return connector
+
+    def _install_binance_policy(self, connector_name, connector):
+        if connector_name in BINANCE_CONNECTORS:
+            self.binance_rate_limits.install(connector_name, connector._web_assistants_factory)
 
     # =========================================================================
     # Network and State Management
@@ -872,20 +881,22 @@ class UnifiedConnectorService:
         self,
         connector: ConnectorBase,
         connector_name: str,
-        account_name: str = None
+        account_name: str = None,
+        strict: bool = False,
     ):
         """Public API to refresh a single connector's state (balances, positions, orders).
 
         Delegates to the internal _update_connector_state implementation so callers
         in sibling services don't depend on the underscore-prefixed helper.
         """
-        await self._update_connector_state(connector, connector_name, account_name)
+        await self._update_connector_state(connector, connector_name, account_name, strict=strict)
 
     async def _update_connector_state(
         self,
         connector: ConnectorBase,
         connector_name: str,
-        account_name: str = None
+        account_name: str = None,
+        strict: bool = False,
     ):
         """Update connector state (balances, positions, orders).
 
@@ -909,6 +920,8 @@ class UnifiedConnectorService:
 
         except Exception as e:
             logger.error(f"Error updating connector state: {e}")
+            if strict:
+                raise
 
     async def update_all_trading_connector_states(self):
         """Update state for all trading connectors in parallel."""

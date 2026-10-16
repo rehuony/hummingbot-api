@@ -71,7 +71,7 @@ After hummingbot-api is running, these services are available:
 |---------|-----------|--------------------------------------|-------------|
 | **API** | http://localhost:8000 | http://hummingbot-api:8000 | REST API |
 | **Swagger UI** | http://localhost:8000/docs | http://hummingbot-api:8000/docs | Interactive API documentation |
-| **PostgreSQL** | localhost:5432 | — | Database |
+| **PostgreSQL** | Internal Docker network; localhost:5432 with `make run` | — | Database |
 | **EMQX** | 127.0.0.1:1883 | — | MQTT broker (auth required, loopback-only) |
 | **EMQX Dashboard** | http://127.0.0.1:18083 | — | Broker admin (`admin` / `BROKER_DASHBOARD_PASSWORD`) |
 
@@ -96,15 +96,21 @@ After hummingbot-api is running, these services are available:
 > the broker issue authenticated HTTP requests into internal services, and it survives
 > restarts. Use `make emqx-audit EMQX_CONTAINER=<name>` to check another deployment.
 
-> **Ports.** The API (`8000`) and Postgres (`5432`) also bind to `127.0.0.1` by default. Set
+> **Ports.** The API (`8000`) binds to `127.0.0.1` by default. Set
 > `API_BIND` in `.env` if something off-box must reach the API — prefer a specific interface
 > over `0.0.0.0`; with the Tailscale overlay, `API_BIND=<tailscale-ip>` keeps MagicDNS working
 > without publishing the API to the internet.
 
-PostgreSQL and EMQX are bound to `127.0.0.1` only — they're never reachable
-from another machine, on the tailnet or otherwise. Bot containers still reach
-them fine (they run with `network_mode: host`, so `127.0.0.1` is their host's
-loopback too).
+Docker deployments keep PostgreSQL on the internal Compose network. For source
+development, `make run` adds `docker-compose.source.yml` to publish PostgreSQL at
+`127.0.0.1:5432` (overridable with `DB_BIND`); the generated `DATABASE_URL` then
+works from host-run uvicorn. EMQX remains loopback-only. Bot containers reach the
+broker through host networking.
+
+`make run` explicitly selects the base and source Compose files. If you use a custom
+`docker-compose.override.yml` or `COMPOSE_FILE`, start the dependencies with those
+files plus `docker-compose.source.yml`, then start the local API with
+`conda run --no-capture-output -n hummingbot-api uvicorn main:app --reload`.
 
 ## Connect AI Assistant (MCP)
 
@@ -184,7 +190,7 @@ TAILSCALE_ENABLED=true
 TAILSCALE_AUTH_KEY=tskey-auth-...
 TAILSCALE_HOSTNAME=hummingbot-api   # MagicDNS hostname on your tailnet
 
-# Published-port bind addresses (both default to 127.0.0.1 in docker-compose.yml).
+# Published-port bind addresses (127.0.0.1 by default; DB_BIND is for make run only).
 # Widen API_BIND only if something off-box must reach the API directly — with the
 # Tailscale overlay, API_BIND=<tailscale-ip> keeps MagicDNS working without ever
 # publishing the API to the internet. See docker-compose.yml / docker-compose.tailscale.yml
@@ -198,6 +204,43 @@ the optional `PERFORMANCE_`, `BACKTESTING_`, `MARKET_DATA_`, `CORS_` and `AWS_` 
 lines showing their defaults, so you can see and override them without leaving the file.
 
 Edit `.env` and restart with `make deploy` to apply changes.
+
+### Historical market data and Binance request limits
+
+Use `/market-data/historical-candles` for scans and research. It downloads REST pages
+without starting a live candle feed. Concurrent requests for the same market and
+interval-aligned window share one download; each response is trimmed to its requested
+start/end timestamps. At most four historical downloads run concurrently. The disk cache
+defaults to 128 ranges with a 15-second freshness bound, including forming candles:
+
+```bash
+#MARKET_DATA_HISTORICAL_CACHE_PATH=data/market_candles
+#MARKET_DATA_HISTORICAL_CACHE_ENTRIES=128
+#MARKET_DATA_HISTORICAL_CACHE_TTL_SECONDS=15.0
+```
+
+Set entries to zero to disable the cache. Failed or empty downloads are not cached.
+Live `/market-data/candles` requests continue to use managed WebSocket feeds.
+
+API-owned Binance connectors and candle feeds share a request-weight budget across
+accounts, separately for spot, USD-M futures and test/US domains. The budget uses 80%
+of the connector's configured IP allowance and retains its existing order throttles.
+Futures candle pages use at most 499 rows (weight 2); requests below 100 rows use weight 1.
+Bulk 24-hour ticker requests use weight 80 for spot and 40 for futures. The adapter preserves
+the historical endpoint's inclusive end timestamp across pages, including UTC calendar weeks
+and months.
+See Binance's [USD-M market data documentation](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data).
+
+HTTP 418/429 pauses the shared budget using `Retry-After` or the reported ban expiry.
+Background REST requests wait; historical callers receive HTTP 429 with `Retry-After`.
+High `X-MBX-USED-WEIGHT-1M` usage also pauses new requests, except on futures endpoints
+whose headers Binance documents as inaccurate. Do not immediately retry
+against the live-candles endpoint: it uses the same IP allowance.
+
+This coordination is scoped to one API process. Independent bots, backtest workers and
+scripts using Binance directly still consume the same egress IP's allowance; they must
+budget their own traffic or request historical data through this API. Successful response
+headers provide a brake for external usage, not a distributed reservation system.
 
 ## Secure Connection via Tailscale
 

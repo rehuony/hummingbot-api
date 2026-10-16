@@ -21,7 +21,9 @@ class AccountRepository:
             "units": float(token_state.units),
             "price": float(token_state.price),
             "value": float(token_state.value),
-            "available_units": float(token_state.available_units)
+            "available_units": float(token_state.available_units),
+            "unrealized_pnl": float(token_state.unrealized_pnl) if token_state.unrealized_pnl is not None else None,
+            "equity_value": float(token_state.equity_value) if token_state.equity_value is not None else None,
         }
 
     @staticmethod
@@ -104,7 +106,11 @@ class AccountRepository:
                 units=Decimal(str(token_info["units"])),
                 price=Decimal(str(token_info["price"])),
                 value=Decimal(str(token_info["value"])),
-                available_units=Decimal(str(token_info["available_units"]))
+                available_units=Decimal(str(token_info["available_units"])),
+                unrealized_pnl=(Decimal(str(token_info["unrealized_pnl"]))
+                                if token_info.get("unrealized_pnl") is not None else None),
+                equity_value=(Decimal(str(token_info["equity_value"]))
+                              if token_info.get("equity_value") is not None else None),
             )
             self.session.add(token_state)
 

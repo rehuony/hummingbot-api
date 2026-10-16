@@ -12,7 +12,7 @@ $(SETUP_SENTINEL):
 # When TAILSCALE_ENABLED=true: installs Tailscale if needed, connects, configures tailscale serve,
 # then binds uvicorn to 127.0.0.1 only (tailscale serve exposes port 8000 on the tailnet)
 run: emqx-auth
-	docker compose up emqx postgres -d
+	docker compose -f docker-compose.yml -f docker-compose.source.yml up emqx postgres -d
 	@set -a; [ -f .env ] && . ./.env; set +a; \
 	if [ "$${TAILSCALE_ENABLED:-false}" = "true" ]; then \
 		echo "[INFO] Tailscale mode: setting up Tailscale for source install..."; \

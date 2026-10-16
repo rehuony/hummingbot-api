@@ -276,16 +276,19 @@ def test_reports_the_market_data_tunables(make_client):
 
     body = make_client(_Client(_container())).get("/system/info").json()
 
-    assert body["market_data"] == settings.market_data.model_dump()
+    assert body["market_data"] == settings.market_data.model_dump(exclude={"historical_cache_path"})
     assert body["market_data"]["ticker_update_interval"] == settings.market_data.ticker_update_interval
 
 
-def test_market_data_tunables_carry_no_secret(make_client):
-    # MarketDataSettings is intervals and timeouts by construction. Pinned so a later
-    # field that does not belong in an unauthenticated-looking payload fails here first.
+def test_market_data_tunables_carry_no_secret(make_client, monkeypatch):
+    from config import settings
+
+    # Local cache paths are not part of the dashboard's numeric tuning contract.
+    monkeypatch.setattr(settings.market_data, "historical_cache_path", "/private/deployment/cache")
     body = make_client(_Client(_container())).get("/system/info").json()
 
     assert body["market_data"]
+    assert "historical_cache_path" not in body["market_data"]
     assert all(isinstance(v, (int, float)) for v in body["market_data"].values())
     assert not any(
         word in key.lower()
