@@ -471,6 +471,14 @@ echo ""
 # --------------------------
 # Existing .env creation flow
 # --------------------------
+# Runtime profiles are local state. Seed the shipped privacy defaults only when
+# missing, including installations with an existing .env; never replace a profile.
+client_profile="bots/credentials/master_account/conf_client.yml"
+if [ ! -e "$client_profile" ] && [ ! -L "$client_profile" ]; then
+  mkdir -p "$(dirname "$client_profile")"
+  install -m 600 templates/master_account/conf_client.yml "$client_profile"
+fi
+
 if [ -f ".env" ]; then
   echo ".env file already exists. Skipping setup."
   echo ""
@@ -719,7 +727,8 @@ BROKER_DASHBOARD_PASSWORD=$BROKER_DASHBOARD_PASSWORD
 # Database (auto-configured by docker-compose)
 DATABASE_URL=postgresql+asyncpg://hbot:hummingbot-api@localhost:5432/hummingbot_api
 
-# Published-port bind addresses. Both default to 127.0.0.1 in docker-compose.yml.
+# Published-port bind addresses default to 127.0.0.1. DB_BIND applies only to
+# make run (docker-compose.source.yml); Docker deployments do not publish Postgres.
 # Widen API_BIND only if something off-box must reach the API, and prefer a specific
 # interface over 0.0.0.0 — e.g. API_BIND=<your-tailscale-ip> with the Tailscale overlay.
 # API_BIND=127.0.0.1
@@ -728,7 +737,7 @@ DATABASE_URL=postgresql+asyncpg://hbot:hummingbot-api@localhost:5432/hummingbot_
 # Gateway (optional). Reuses CONFIG_PASSWORD rather than a hardcoded default:
 # this passphrase unlocks Gateway's DEX wallet keys, and "admin" is the first
 # thing anyone who reaches the port will try.
-GATEWAY_URL=http://localhost:15888
+GATEWAY_URL=https://localhost:15888
 GATEWAY_PASSPHRASE=$CONFIG_PASSWORD
 
 # Paths
@@ -793,6 +802,10 @@ TAILSCALE_HOSTNAME=$TAILSCALE_HOSTNAME
 #MARKET_DATA_FEED_TIMEOUT=600
 # How long to wait for a candle feed to become ready, in seconds.
 #MARKET_DATA_CANDLES_READY_TIMEOUT=30
+# REST historical ranges: shared cache with a strict freshness and entry bound
+#MARKET_DATA_HISTORICAL_CACHE_PATH=data/market_candles
+#MARKET_DATA_HISTORICAL_CACHE_ENTRIES=128
+#MARKET_DATA_HISTORICAL_CACHE_TTL_SECONDS=15.0
 # WebSocket heartbeat interval, in seconds.
 #MARKET_DATA_WS_HEARTBEAT_INTERVAL=30
 # Allowed range for a market-data WebSocket subscription update interval, in seconds.
@@ -858,8 +871,9 @@ echo ".env created successfully!"
 echo ""
 echo "Next steps:"
 echo ""
-echo "Option 1: Start all services with Docker (recommended)"
-echo "  make deploy"
+echo "Option 1: Build this checkout and start services with Docker (recommended)"
+echo "  make build     # Builds hummingbot-api-local:main without restarting services"
+echo "  make deploy    # Starts or recreates services using the local image"
 echo ""
 echo "Option 2: Run API locally (dev mode)"
 echo "  make install   # Creates the conda environment - Note: Please install the latest Anaconda version manually"

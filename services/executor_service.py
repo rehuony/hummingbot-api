@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
@@ -180,6 +181,8 @@ class ExecutorService:
 
         # Executor metadata: executor_id -> metadata dict
         self._executor_metadata: Dict[str, Dict[str, Any]] = {}
+        # Creation and snapshot writes can outlive completion's metadata cleanup.
+        self._history_writes: Dict[str, int] = {}
 
         # Position holds: key = "account_name|connector_name|trading_pair"
         # Tracks aggregated positions from executors stopped with keep_position=True
@@ -655,23 +658,24 @@ class ExecutorService:
         if not self.db_manager or not self._active_executors:
             return
 
-        snapshot_timestamp = datetime.now(timezone.utc)
-        rows = []
-        for executor_id, executor in list(self._active_executors.items()):
-            row = self._build_snapshot_row(executor_id, executor, is_terminal=False)
-            if row is not None:
-                row["snapshot_timestamp"] = snapshot_timestamp
-                rows.append(row)
+        with self._history_write_scope(tuple(self._active_executors)):
+            snapshot_timestamp = datetime.now(timezone.utc)
+            rows = []
+            for executor_id, executor in list(self._active_executors.items()):
+                row = self._build_snapshot_row(executor_id, executor, is_terminal=False)
+                if row is not None:
+                    row["snapshot_timestamp"] = snapshot_timestamp
+                    rows.append(row)
 
-        if not rows:
-            return
+            if not rows:
+                return
 
-        try:
-            async with self.db_manager.get_session_context() as session:
-                await ExecutorPerformanceRepository(session).save_snapshots(rows)
-            logger.debug(f"Dumped {len(rows)} executor performance snapshots")
-        except Exception as e:
-            logger.error(f"Error saving executor performance snapshots: {e}", exc_info=True)
+            try:
+                async with self.db_manager.get_session_context() as session:
+                    await ExecutorPerformanceRepository(session).save_snapshots(rows)
+                logger.debug(f"Dumped {len(rows)} executor performance snapshots")
+            except Exception as e:
+                logger.error(f"Error saving executor performance snapshots: {e}", exc_info=True)
 
     async def _prune_performance_snapshots(self):
         """Delete snapshots older than the configured retention, from both snapshot tables.
@@ -1116,6 +1120,62 @@ class ExecutorService:
             "status": "stopping",
             "keep_position": keep_position
         }
+
+    @contextmanager
+    def _history_write_scope(self, executor_ids):
+        """Keep deletion from overtaking this process's outstanding history writes."""
+        ids = tuple(executor_ids)
+        for executor_id in ids:
+            self._history_writes[executor_id] = self._history_writes.get(executor_id, 0) + 1
+        try:
+            yield
+        finally:
+            for executor_id in ids:
+                remaining = self._history_writes[executor_id] - 1
+                if remaining:
+                    self._history_writes[executor_id] = remaining
+                else:
+                    del self._history_writes[executor_id]
+
+    async def delete_executor(self, executor_id: str) -> Dict[str, Any]:
+        """Permanently delete a finished executor's history; never trade or clear holds."""
+        # Metadata outlives the active entry while completion is being persisted.
+        # Refuse that window too, otherwise completion could recreate a deleted row.
+        if (executor_id in self._active_executors or executor_id in self._executor_metadata
+                or self._history_writes.get(executor_id)):
+            raise HTTPException(status_code=409, detail="Executor is running or still completing")
+        if not self.db_manager:
+            raise HTTPException(status_code=503, detail="Executor history database unavailable")
+
+        async with self.db_manager.get_session_context() as session:
+            repo = ExecutorRepository(session)
+            record = await repo.get_executor_by_id(executor_id, for_update=True)
+            if record is None:
+                raise HTTPException(status_code=404, detail=f"Executor {executor_id} not found")
+            if record.status != "TERMINATED":
+                raise HTTPException(status_code=409, detail="Only TERMINATED executor history can be deleted")
+            if (executor_id in self._active_executors or executor_id in self._executor_metadata
+                    or self._history_writes.get(executor_id)):
+                raise HTTPException(status_code=409, detail="Executor is running or still completing")
+
+            if record.executor_type == "lp_executor":
+                try:
+                    final_state = json.loads(record.final_state or "{}")
+                    if not isinstance(final_state, dict):
+                        raise ValueError("Invalid final state")
+                except (ValueError, TypeError):
+                    raise HTTPException(status_code=409, detail="LP final state needs reconciliation before deletion")
+                if not final_state.get("orphan_resolved") and (
+                    record.close_type == "SYSTEM_CLEANUP"
+                    or final_state.get("position_address")
+                    or final_state.get("orphaned_position")
+                    or final_state.get("hold_reason")
+                ):
+                    raise HTTPException(status_code=409, detail="Resolve the orphaned LP position before deleting its history")
+
+            await repo.delete_executor(executor_id)
+
+        return {"executor_id": executor_id, "deleted": True}
 
     async def get_orphaned_positions(self) -> List[Dict[str, Any]]:
         """
@@ -1575,199 +1635,201 @@ class ExecutorService:
         if not self.db_manager:
             return
 
-        try:
-            metadata = self._executor_metadata.get(executor_id, {})
+        with self._history_write_scope((executor_id,)):
+            try:
+                metadata = self._executor_metadata.get(executor_id, {})
 
-            async with self.db_manager.get_session_context() as session:
-                repo = ExecutorRepository(session)
+                async with self.db_manager.get_session_context() as session:
+                    repo = ExecutorRepository(session)
 
-                await repo.create_executor(
-                    executor_id=executor_id,
-                    executor_type=metadata.get("executor_type"),
-                    account_name=metadata.get("account_name"),
-                    connector_name=metadata.get("connector_name"),
-                    trading_pair=metadata.get("trading_pair"),
-                    config=json.dumps(metadata.get("config", {}), default=_json_default),
-                    status=executor.status.name,
-                    controller_id=metadata.get("controller_id", "main")
+                    await repo.create_executor(
+                        executor_id=executor_id,
+                        executor_type=metadata.get("executor_type"),
+                        account_name=metadata.get("account_name"),
+                        connector_name=metadata.get("connector_name"),
+                        trading_pair=metadata.get("trading_pair"),
+                        config=json.dumps(metadata.get("config", {}), default=_json_default),
+                        status=executor.status.name,
+                        controller_id=metadata.get("controller_id", "main")
+                    )
+
+                logger.debug(f"Persisted executor {executor_id} creation to database")
+
+            except IntegrityError:
+                # The executor closed before this INSERT landed and its completion already
+                # wrote the row (see upsert_executor_completion). That row carries the final
+                # state; re-inserting a RUNNING one is exactly what must not happen.
+                logger.debug(
+                    f"Executor {executor_id} row already written by its completion; "
+                    f"skipping the creation insert"
                 )
-
-            logger.debug(f"Persisted executor {executor_id} creation to database")
-
-        except IntegrityError:
-            # The executor closed before this INSERT landed and its completion already
-            # wrote the row (see upsert_executor_completion). That row carries the final
-            # state; re-inserting a RUNNING one is exactly what must not happen.
-            logger.debug(
-                f"Executor {executor_id} row already written by its completion; "
-                f"skipping the creation insert"
-            )
-        except Exception as e:
-            logger.error(f"Error persisting executor creation: {e}")
+            except Exception as e:
+                logger.error(f"Error persisting executor creation: {e}")
 
     async def _persist_executor_completed(self, executor_id: str, executor: ExecutorBase):
         """Persist executor completion to database."""
         if not self.db_manager:
             return
 
-        try:
-            # Read status/close_type directly from executor (most reliable)
-            status_name = executor.status.name
-            close_type = executor.close_type.name if executor.close_type else None
-
-            # Get PnL values from executor_info
+        with self._history_write_scope((executor_id,)):
             try:
-                executor_info = executor.executor_info
-                net_pnl_quote = executor_info.net_pnl_quote
-                net_pnl_pct = executor_info.net_pnl_pct
-                cum_fees_quote = executor_info.cum_fees_quote
-                filled_amount_quote = executor_info.filled_amount_quote
-                metrics_are_measured = True
-            except Exception as e:
-                logger.debug(f"Error accessing executor_info for persistence: {e}")
-                net_pnl_quote = Decimal("0")
-                net_pnl_pct = Decimal("0")
-                cum_fees_quote = Decimal("0")
-                filled_amount_quote = Decimal("0")
-                # The record still takes these zeros, as it always has. The snapshot
-                # series does not: a terminal row is what a reader takes for the
-                # executor's final value, and a fabricated zero there is indistinguishable
-                # from an executor that genuinely made nothing.
-                metrics_are_measured = False
+                # Read status/close_type directly from executor (most reliable)
+                status_name = executor.status.name
+                close_type = executor.close_type.name if executor.close_type else None
 
-            # Get custom_info directly from executor to avoid Pydantic serialization issues
-            # with TrackedOrder and other complex types
-            custom_info = executor.get_custom_info()
-
-            # A stranded live on-chain position: an involuntary hold (close retries
-            # exhausted -> POSITION_HOLD with hold_reason set, gateway#678) or a legacy
-            # FAILED-with-position (force-stop straggler, older wheel). Flag it in the
-            # persisted final_state so /executors/positions/orphaned, dashboards, and
-            # agents can find and recover it. Voluntary holds never match: a successful
-            # close clears position_address before the executor terminates.
-            if custom_info.get("position_address") and (
-                custom_info.get("hold_reason") or close_type == "FAILED"
-            ):
-                custom_info["orphaned_position"] = True
-            # Serialize custom_info, fallback to None if serialization fails
-            final_state_json = None
-            metadata = self._executor_metadata.get(executor_id, {})
-            executor_type = metadata.get("executor_type")
-            if executor_type == "grid_executor":
-                heavy_fields = {
-                    "levels_by_state",
-                    "filled_orders",
-                    "failed_orders",
-                    "canceled_orders",
-                }
-                custom_info = {k: v for k, v in custom_info.items() if k not in heavy_fields}
-
-            try:
-                final_state_json = json.dumps(custom_info, default=_json_default)
-            except Exception as e:
-                logger.warning(f"Failed to serialize custom_info for {executor_id}: {e}")
-                # Try a simpler serialization without complex objects
+                # Get PnL values from executor_info
                 try:
-                    simple_info = {k: v for k, v in custom_info.items()
-                                   if isinstance(v, (str, int, float, bool, list, dict, type(None)))}
-                    final_state_json = json.dumps(simple_info)
-                except Exception:
-                    final_state_json = None
-
-            # Capture error logs before persisting
-            error_log_json = None
-            error_count = self._log_capture.get_error_count(executor_id)
-            if error_count > 0:
-                try:
-                    error_entries = self._log_capture.get_logs(executor_id, level="ERROR")
-                    error_log_json = json.dumps([
-                        {
-                            "timestamp": entry.get("timestamp"),
-                            "message": entry.get("message"),
-                            "exc_info": entry.get("exc_info"),
-                        }
-                        for entry in error_entries
-                    ])
+                    executor_info = executor.executor_info
+                    net_pnl_quote = executor_info.net_pnl_quote
+                    net_pnl_pct = executor_info.net_pnl_pct
+                    cum_fees_quote = executor_info.cum_fees_quote
+                    filled_amount_quote = executor_info.filled_amount_quote
+                    metrics_are_measured = True
                 except Exception as e:
-                    logger.debug(f"Failed to serialize error logs for {executor_id}: {e}")
+                    logger.debug(f"Error accessing executor_info for persistence: {e}")
+                    net_pnl_quote = Decimal("0")
+                    net_pnl_pct = Decimal("0")
+                    cum_fees_quote = Decimal("0")
+                    filled_amount_quote = Decimal("0")
+                    # The record still takes these zeros, as it always has. The snapshot
+                    # series does not: a terminal row is what a reader takes for the
+                    # executor's final value, and a fabricated zero there is indistinguishable
+                    # from an executor that genuinely made nothing.
+                    metrics_are_measured = False
 
-            async with self.db_manager.get_session_context() as session:
-                repo = ExecutorRepository(session)
+                # Get custom_info directly from executor to avoid Pydantic serialization issues
+                # with TrackedOrder and other complex types
+                custom_info = executor.get_custom_info()
 
-                # Upsert, not update: an executor that closes in milliseconds can reach
-                # here before _persist_executor_created's INSERT has landed (or after it
-                # failed outright), and a plain select-then-update would silently drop
-                # this final state, leaving a phantom RUNNING executor forever.
-                record, repaired = await repo.upsert_executor_completion(
-                    executor_id=executor_id,
-                    executor_type=executor_type,
-                    account_name=metadata.get("account_name"),
-                    connector_name=metadata.get("connector_name"),
-                    trading_pair=metadata.get("trading_pair"),
-                    controller_id=metadata.get("controller_id", "main"),
-                    config=json.dumps(metadata.get("config", {}), default=_json_default),
-                    created_at=metadata.get("created_at"),
-                    status=status_name,
-                    close_type=close_type,
-                    net_pnl_quote=net_pnl_quote,
-                    net_pnl_pct=net_pnl_pct,
-                    cum_fees_quote=cum_fees_quote,
-                    filled_amount_quote=filled_amount_quote,
-                    final_state=final_state_json,
-                    error_log=error_log_json
-                )
+                # A stranded live on-chain position: an involuntary hold (close retries
+                # exhausted -> POSITION_HOLD with hold_reason set, gateway#678) or a legacy
+                # FAILED-with-position (force-stop straggler, older wheel). Flag it in the
+                # persisted final_state so /executors/positions/orphaned, dashboards, and
+                # agents can find and recover it. Voluntary holds never match: a successful
+                # close clears position_address before the executor terminates.
+                if custom_info.get("position_address") and (
+                    custom_info.get("hold_reason") or close_type == "FAILED"
+                ):
+                    custom_info["orphaned_position"] = True
+                # Serialize custom_info, fallback to None if serialization fails
+                final_state_json = None
+                metadata = self._executor_metadata.get(executor_id, {})
+                executor_type = metadata.get("executor_type")
+                if executor_type == "grid_executor":
+                    heavy_fields = {
+                        "levels_by_state",
+                        "filled_orders",
+                        "failed_orders",
+                        "canceled_orders",
+                    }
+                    custom_info = {k: v for k, v in custom_info.items() if k not in heavy_fields}
 
-                # The terminal row, in the same transaction as the record update so the
-                # two never disagree. It is what makes a closed executor's series
-                # answerable from executor_performance_snapshots alone -- no join, and no
-                # "and then append the final value" rule for every future reader.
-                #
-                # Behind a SAVEPOINT, because the direction of the coupling matters: the
-                # record update is the accounting and the snapshot is a point on a chart,
-                # so a failing snapshot must roll back only itself. Without it a bad
-                # INSERT here would abort the transaction and lose the completion, which
-                # is the failure 60041a8 went to some trouble to make impossible.
-                if record is not None and metrics_are_measured:
-                    terminal_row = self._build_snapshot_row(
-                        executor_id,
-                        executor,
-                        is_terminal=True,
-                        metrics={
-                            "net_pnl_quote": net_pnl_quote,
-                            "net_pnl_pct": net_pnl_pct,
-                            "cum_fees_quote": cum_fees_quote,
-                            "filled_amount_quote": filled_amount_quote,
-                        },
+                try:
+                    final_state_json = json.dumps(custom_info, default=_json_default)
+                except Exception as e:
+                    logger.warning(f"Failed to serialize custom_info for {executor_id}: {e}")
+                    # Try a simpler serialization without complex objects
+                    try:
+                        simple_info = {k: v for k, v in custom_info.items()
+                                       if isinstance(v, (str, int, float, bool, list, dict, type(None)))}
+                        final_state_json = json.dumps(simple_info)
+                    except Exception:
+                        final_state_json = None
+
+                # Capture error logs before persisting
+                error_log_json = None
+                error_count = self._log_capture.get_error_count(executor_id)
+                if error_count > 0:
+                    try:
+                        error_entries = self._log_capture.get_logs(executor_id, level="ERROR")
+                        error_log_json = json.dumps([
+                            {
+                                "timestamp": entry.get("timestamp"),
+                                "message": entry.get("message"),
+                                "exc_info": entry.get("exc_info"),
+                            }
+                            for entry in error_entries
+                        ])
+                    except Exception as e:
+                        logger.debug(f"Failed to serialize error logs for {executor_id}: {e}")
+
+                async with self.db_manager.get_session_context() as session:
+                    repo = ExecutorRepository(session)
+
+                    # Upsert, not update: an executor that closes in milliseconds can reach
+                    # here before _persist_executor_created's INSERT has landed (or after it
+                    # failed outright), and a plain select-then-update would silently drop
+                    # this final state, leaving a phantom RUNNING executor forever.
+                    record, repaired = await repo.upsert_executor_completion(
+                        executor_id=executor_id,
+                        executor_type=executor_type,
+                        account_name=metadata.get("account_name"),
+                        connector_name=metadata.get("connector_name"),
+                        trading_pair=metadata.get("trading_pair"),
+                        controller_id=metadata.get("controller_id", "main"),
+                        config=json.dumps(metadata.get("config", {}), default=_json_default),
+                        created_at=metadata.get("created_at"),
                         status=status_name,
                         close_type=close_type,
+                        net_pnl_quote=net_pnl_quote,
+                        net_pnl_pct=net_pnl_pct,
+                        cum_fees_quote=cum_fees_quote,
+                        filled_amount_quote=filled_amount_quote,
+                        final_state=final_state_json,
+                        error_log=error_log_json
                     )
-                    if terminal_row is not None:
-                        try:
-                            async with session.begin_nested():
-                                await ExecutorPerformanceRepository(session).save_snapshots(
-                                    [terminal_row]
+
+                    # The terminal row, in the same transaction as the record update so the
+                    # two never disagree. It is what makes a closed executor's series
+                    # answerable from executor_performance_snapshots alone -- no join, and no
+                    # "and then append the final value" rule for every future reader.
+                    #
+                    # Behind a SAVEPOINT, because the direction of the coupling matters: the
+                    # record update is the accounting and the snapshot is a point on a chart,
+                    # so a failing snapshot must roll back only itself. Without it a bad
+                    # INSERT here would abort the transaction and lose the completion, which
+                    # is the failure 60041a8 went to some trouble to make impossible.
+                    if record is not None and metrics_are_measured:
+                        terminal_row = self._build_snapshot_row(
+                            executor_id,
+                            executor,
+                            is_terminal=True,
+                            metrics={
+                                "net_pnl_quote": net_pnl_quote,
+                                "net_pnl_pct": net_pnl_pct,
+                                "cum_fees_quote": cum_fees_quote,
+                                "filled_amount_quote": filled_amount_quote,
+                            },
+                            status=status_name,
+                            close_type=close_type,
+                        )
+                        if terminal_row is not None:
+                            try:
+                                async with session.begin_nested():
+                                    await ExecutorPerformanceRepository(session).save_snapshots(
+                                        [terminal_row]
+                                    )
+                            except Exception as e:
+                                logger.error(
+                                    f"Could not write the terminal performance snapshot for "
+                                    f"{executor_id}; its series ends at the last periodic row: {e}"
                                 )
-                        except Exception as e:
-                            logger.error(
-                                f"Could not write the terminal performance snapshot for "
-                                f"{executor_id}; its series ends at the last periodic row: {e}"
-                            )
 
-            if record is None:
-                logger.error(
-                    f"Could not persist completion for executor {executor_id}: no row to "
-                    f"update and the repair insert did not take"
-                )
-            elif repaired:
-                logger.warning(
-                    f"Executor {executor_id} completed before its creation row existed; "
-                    f"inserted the record from its final state"
-                )
-            else:
-                logger.debug(f"Persisted executor {executor_id} completion to database")
+                if record is None:
+                    logger.error(
+                        f"Could not persist completion for executor {executor_id}: no row to "
+                        f"update and the repair insert did not take"
+                    )
+                elif repaired:
+                    logger.warning(
+                        f"Executor {executor_id} completed before its creation row existed; "
+                        f"inserted the record from its final state"
+                    )
+                else:
+                    logger.debug(f"Persisted executor {executor_id} completion to database")
 
-        except Exception as e:
-            logger.error(f"Error persisting executor completion: {e}")
+            except Exception as e:
+                logger.error(f"Error persisting executor completion: {e}")
 
     # ========================================
     # Position Hold Tracking Methods

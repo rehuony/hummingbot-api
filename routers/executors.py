@@ -327,6 +327,25 @@ async def get_executor(
         raise HTTPException(status_code=500, detail=f"Error getting executor: {str(e)}")
 
 
+@router.delete("/{executor_id}")
+async def delete_executor(
+    executor_id: str,
+    executor_service: ExecutorService = Depends(get_executor_service)
+):
+    """Delete TERMINATED executor history and performance snapshots.
+
+    Running/completing executors and unresolved LP positions return 409.
+    Exchange orders, trades and held positions are not changed.
+    """
+    try:
+        return await executor_service.delete_executor(executor_id)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Error deleting executor %s", executor_id)
+        raise HTTPException(status_code=500, detail="Failed to delete executor history")
+
+
 @router.post("/{executor_id}/stop", response_model=StopExecutorResponse)
 async def stop_executor(
     executor_id: str,

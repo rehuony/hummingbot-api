@@ -16,8 +16,12 @@ if TYPE_CHECKING:
 
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.data_feed.candles_feed.candles_factory import CandlesFactory, UnsupportedConnectorException
-from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
+from hummingbot.data_feed.candles_feed.data_types import CandlesConfig, HistoricalCandlesConfig
 
+from config import settings
+from services.binance_candles import create_candle_feed
+from services.binance_rate_limits import BINANCE_CONNECTORS, BinanceRateLimitError, BinanceRateLimits
+from services.candles_cache import CandlesCache, cache_key
 from services.ticker_sources import Ticker, TickerFetchError, TickerUnsupportedError, fetch_tickers
 from services.unified_connector_service import UnknownConnectorError
 from utils.rate_finder import find_rate
@@ -92,8 +96,16 @@ class MarketDataService:
         # no reference in _candle_feeds and no teardown path can ever stop them.
         self._candle_feeds: Dict[str, Any] = {}
         self._candle_feed_locks: Dict[str, asyncio.Lock] = {}
+        self._candle_stop_tasks: set[asyncio.Task] = set()
         self._last_access_times: Dict[str, float] = {}
         self._feed_configs: Dict[str, Tuple[FeedType, Any]] = {}
+
+        self._binance_rate_limits = (
+            connector_service.binance_rate_limits if connector_service is not None else BinanceRateLimits()
+        )
+        self._historical_cache = None
+        self._historical_tasks = {}
+        self._historical_slots = asyncio.Semaphore(4)
 
         # Ticker pool: per-connector tickers gathered from connected exchanges, plus a merged
         # price dict used by the cross-rate finder. External (e.g. blockchain/Gateway) prices
@@ -140,25 +152,32 @@ class MarketDataService:
         except Exception as e:
             logger.warning(f"Ticker warmup failed: {e}")
 
-    def stop(self):
+    async def stop(self):
         """Stop the market data service and cleanup all feeds."""
         self._is_running = False
 
-        if self._cleanup_task:
-            self._cleanup_task.cancel()
-            self._cleanup_task = None
-
-        if self._ticker_task:
-            self._ticker_task.cancel()
-            self._ticker_task = None
+        tasks = [
+            task for task in (self._cleanup_task, self._ticker_task, *self._historical_tasks.values()) if task is not None
+        ]
+        for task in tasks:
+            task.cancel()
+        self._cleanup_task = None
+        self._ticker_task = None
 
         # Stop all candle feeds
         for feed_key, feed in self._candle_feeds.items():
             try:
-                feed.stop()
+                self._stop_candle_feed_network(feed)
             except Exception as e:
                 logger.error(f"Error stopping candle feed {feed_key}: {e}")
 
+        # Cancelled candle listeners disconnect their own WebSockets in finally.
+        # Let them finish before application shutdown closes the shared sessions.
+        tasks.extend(self._candle_stop_tasks)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._candle_stop_tasks.clear()
+        self._historical_tasks.clear()
         self._candle_feeds.clear()
         self._candle_feed_locks.clear()
         self._last_access_times.clear()
@@ -463,7 +482,7 @@ class MarketDataService:
                     f"Trading pair '{trading_pair}' not found on '{connector_name}'. "
                     f"No candle data returned."
                 )
-        except ValueError:
+        except (ValueError, BinanceRateLimitError):
             raise
         except Exception as e:
             raise ValueError(
@@ -498,8 +517,14 @@ class MarketDataService:
                 # have created and registered the feed while we waited on the lock.
                 if feed_key not in self._candle_feeds:
                     self.validate_connector(config.connector)
-                    feed = CandlesFactory.get_candle(config)
-                    await self._validate_pair(feed, config.connector, config.trading_pair)
+                    self._binance_rate_limits.raise_if_blocked(config.connector)
+                    feed = self._create_candle_feed(config, live=True)
+                    # Validation only borrows the process-wide REST session. A failed
+                    # probe must not close it underneath other feeds or trading connectors.
+                    await asyncio.wait_for(
+                        self._validate_pair(feed, config.connector, config.trading_pair),
+                        timeout=settings.market_data.candles_ready_timeout,
+                    )
                     feed.start()
                     self._candle_feeds[feed_key] = feed
                     self._feed_configs[feed_key] = (FeedType.CANDLES, config)
@@ -507,6 +532,78 @@ class MarketDataService:
 
         self._last_access_times[feed_key] = time.time()
         return self._candle_feeds[feed_key]
+
+    def _create_candle_feed(self, config, *, live):
+        self.validate_connector(config.connector)
+        feed = create_candle_feed(config)
+        if config.connector in BINANCE_CONNECTORS and self._connector_service is not None and hasattr(feed, "attach_connector"):
+            connector = self._connector_service.get_best_connector_for_market(config.connector)
+            if connector is not None:
+                feed.attach_connector(connector)
+        self._binance_rate_limits.install(config.connector, feed._api_factory, wait_on_cooldown=live)
+        return feed
+
+    async def get_historical_candles(self, config: HistoricalCandlesConfig):
+        """One-shot REST download: no WS subscription, probe, or background backfill.
+
+        Canonical interval boundaries let rolling SDK requests share a cache entry.
+        Each caller still receives only its exact requested range, with its own frame.
+        Failed downloads never enter the cache; timed-out callers cannot cancel a
+        download that another caller is using.
+        """
+        self.validate_connector(config.connector_name)
+        feed_config = CandlesConfig(connector=config.connector_name, trading_pair=config.trading_pair, interval=config.interval)
+        # Constructing a feed is local; exchange initialization only happens on a cache miss.
+        feed = create_candle_feed(feed_config)
+        if config.start_time > config.end_time:
+            raise ValueError("start_time must not exceed end_time")
+        start = feed._round_timestamp_to_interval_multiple(config.start_time)
+        end = feed._round_timestamp_to_interval_multiple(config.end_time)
+        key = cache_key(config.connector_name, config.trading_pair, config.interval, start, end)
+        if self._historical_cache is None:
+            self._historical_cache = CandlesCache(
+                settings.market_data.historical_cache_path,
+                settings.market_data.historical_cache_entries,
+                settings.market_data.historical_cache_ttl_seconds,
+            )
+        frame = await asyncio.to_thread(self._historical_cache.get, key)
+        if frame is None:
+            task = self._historical_tasks.get(key)
+            if task is None:
+                canonical = config.model_copy(update={"start_time": start, "end_time": end})
+                task = asyncio.create_task(self._download_historical_candles(feed_config, canonical, key))
+                self._historical_tasks[key] = task
+
+                def done(completed):
+                    if self._historical_tasks.get(key) is completed:
+                        self._historical_tasks.pop(key, None)
+                    if not completed.cancelled():
+                        completed.exception()  # Retrieve a failure even if all callers timed out.
+
+                task.add_done_callback(done)
+            frame = await asyncio.shield(task)
+        if frame is None or frame.empty:
+            return frame
+        return frame.loc[(frame["timestamp"] >= config.start_time) & (frame["timestamp"] <= config.end_time)].copy()
+
+    async def _download_historical_candles(self, feed_config, config, key):
+        async def download():
+            async with self._historical_slots:
+                # A disk lookup may finish after another download's completion
+                # callback removed its task. Recheck before issuing another request.
+                cached = await asyncio.to_thread(self._historical_cache.get, key)
+                if cached is not None:
+                    return cached
+                self._binance_rate_limits.raise_if_blocked(config.connector_name)
+                feed = self._create_candle_feed(feed_config, live=False)
+                # Candle factories share the process-wide connection pools. Finishing
+                # one REST download must leave those sessions available to other users.
+                frame = await feed.get_historical_candles(config)
+                if frame is not None and not frame.empty:
+                    await asyncio.to_thread(self._historical_cache.put, key, frame)
+                return frame
+
+        return await asyncio.wait_for(download(), timeout=settings.market_data.candles_ready_timeout)
 
     async def get_candles_df(
             self,
@@ -548,6 +645,21 @@ class MarketDataService:
         if lock is not None and not lock.locked():
             del self._candle_feed_locks[feed_key]
 
+    def _stop_candle_feed_network(self, feed) -> set[asyncio.Task]:
+        """Stop a feed and retain its network tasks until their disconnects finish."""
+        # CandlesBase.stop() schedules stop_network(), which cancels and clears these
+        # task attributes. Capture them first so shutdown can await their finally blocks.
+        tasks = {
+            task
+            for name in ("_check_network_task", "_listen_candles_task", "_fill_candles_task")
+            if isinstance(task := getattr(feed, name, None), asyncio.Task)
+        }
+        feed.stop()
+        self._candle_stop_tasks.update(tasks)
+        for task in tasks:
+            task.add_done_callback(self._candle_stop_tasks.discard)
+        return tasks
+
     def stop_candle_feed(self, config: CandlesConfig):
         """Stop a specific candle feed."""
         feed_key = self._generate_feed_key(
@@ -556,7 +668,7 @@ class MarketDataService:
 
         if feed_key in self._candle_feeds:
             try:
-                self._candle_feeds[feed_key].stop()
+                self._stop_candle_feed_network(self._candle_feeds[feed_key])
                 del self._candle_feeds[feed_key]
                 self._discard_candle_feed_lock(feed_key)
                 logger.info(f"Stopped candle feed: {feed_key}")
@@ -619,8 +731,7 @@ class MarketDataService:
         """
         Resolve a rate for a ``BASE-QUOTE`` trading pair from the ticker pool.
 
-        This mirrors the ``RateOracle.get_pair_rate`` interface so it can also serve as the
-        rate provider for connector trade-volume telemetry.
+        Resolves direct, reverse and bridged pairs from the current ticker pool.
         """
         try:
             return find_rate(self._prices, trading_pair)
@@ -663,11 +774,12 @@ class MarketDataService:
     # ==================== Ticker Collection ====================
 
     async def fetch_connector_tickers(
-            self,
-            connector_name: str,
-            *,
-            max_age: Optional[float] = None,
-            force: bool = False
+        self,
+        connector_name: str,
+        *,
+        max_age: Optional[float] = None,
+        force: bool = False,
+        subscribe: bool = True,
     ) -> Dict[str, Ticker]:
         """
         Get one connector's tickers, fetching on demand when the cache is missing or stale.
@@ -679,6 +791,7 @@ class MarketDataService:
             connector_name: Exchange connector name
             max_age: Accept cached tickers up to this age in seconds (defaults to ticker_max_age)
             force: Ignore the cache and always fetch
+            subscribe: Record user demand; background refreshes leave the subscription TTL unchanged
 
         Returns:
             Mapping of trading pair to Ticker
@@ -700,7 +813,8 @@ class MarketDataService:
             )
 
         # Mark the connector as actively requested so the background loop keeps it warm.
-        self._ticker_requests[connector_name] = time.time()
+        if subscribe:
+            self._ticker_requests[connector_name] = time.time()
         max_age = self._ticker_max_age if max_age is None else max_age
 
         if not force and self._is_ticker_fresh(connector_name, max_age):
@@ -727,6 +841,7 @@ class MarketDataService:
             if connector is None:
                 raise TickerFetchError(f"No connector available for '{connector_name}'")
 
+            self._binance_rate_limits.raise_if_blocked(connector_name)
             tickers = await fetch_tickers(connector, connector_name, raise_on_error=True)
             self._tickers[connector_name] = tickers
             self._ticker_updated_at[connector_name] = time.time()
@@ -823,25 +938,16 @@ class MarketDataService:
             self._rebuild_price_pool()
             return
 
-        async def _fetch(name: str) -> Tuple[str, Dict[str, Ticker]]:
-            connector = self._connector_service.get_best_connector_for_market(name)
-            if connector is None:
-                return name, {}
-            return name, await fetch_tickers(connector, name)
-
         results = await asyncio.gather(
-            *[_fetch(name) for name in connector_names], return_exceptions=True
+            *(
+                self.fetch_connector_tickers(name, max_age=self._ticker_update_interval, subscribe=False)
+                for name in connector_names
+            ),
+            return_exceptions=True,
         )
-
-        now = time.time()
         for result in results:
             if isinstance(result, Exception):
                 logger.warning(f"Ticker collection task failed: {result}")
-                continue
-            name, tickers = result
-            if tickers:
-                self._tickers[name] = tickers
-                self._ticker_updated_at[name] = now
 
         self._rebuild_price_pool()
 
@@ -1033,7 +1139,7 @@ class MarketDataService:
         if feed_key in self._feed_configs:
             try:
                 if feed_type == FeedType.CANDLES and feed_key in self._candle_feeds:
-                    self._candle_feeds[feed_key].stop()
+                    self._stop_candle_feed_network(self._candle_feeds[feed_key])
                     del self._candle_feeds[feed_key]
                     self._discard_candle_feed_lock(feed_key)
 
@@ -1063,6 +1169,7 @@ class MarketDataService:
         """Clean up feeds that haven't been accessed within timeout."""
         current_time = time.time()
         feeds_to_remove = []
+        stop_tasks = set()
 
         for feed_key, last_access_time in self._last_access_times.items():
             if current_time - last_access_time > self._feed_timeout:
@@ -1073,7 +1180,7 @@ class MarketDataService:
                 feed_type, config = self._feed_configs[feed_key]
 
                 if feed_type == FeedType.CANDLES and feed_key in self._candle_feeds:
-                    self._candle_feeds[feed_key].stop()
+                    stop_tasks.update(self._stop_candle_feed_network(self._candle_feeds[feed_key]))
                     del self._candle_feeds[feed_key]
                     self._discard_candle_feed_lock(feed_key)
 
@@ -1085,6 +1192,10 @@ class MarketDataService:
             except Exception as e:
                 logger.error(f"Error cleaning up feed {feed_key}: {e}", exc_info=True)
 
+        if stop_tasks:
+            # Shutdown may cancel the janitor while a WebSocket is disconnecting.
+            # Keep that disconnect alive for stop() to await instead of cancelling it twice.
+            await asyncio.shield(asyncio.gather(*stop_tasks, return_exceptions=True))
         if feeds_to_remove:
             logger.info(f"Cleaned up {len(feeds_to_remove)} unused market data feeds")
 

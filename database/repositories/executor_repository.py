@@ -7,11 +7,11 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import and_, case, desc, func, select
+from sqlalchemy import and_, case, delete, desc, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database.models import ExecutorOrder, ExecutorRecord, PositionHoldRecord
+from database.models import ExecutorOrder, ExecutorPerformanceSnapshot, ExecutorRecord, PositionHoldRecord
 from database.repositories.executor_performance_repository import ExecutorPerformanceRepository
 
 logger = logging.getLogger(__name__)
@@ -173,11 +173,22 @@ class ExecutorRepository:
         executor = await self.update_executor(executor_id=executor_id, **completion)
         return executor, created
 
-    async def get_executor_by_id(self, executor_id: str) -> Optional[ExecutorRecord]:
+    async def get_executor_by_id(self, executor_id: str, *, for_update: bool = False) -> Optional[ExecutorRecord]:
         """Get an executor by ID."""
         stmt = select(ExecutorRecord).where(ExecutorRecord.executor_id == executor_id)
+        if for_update:
+            stmt = stmt.with_for_update()
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
+
+    async def delete_executor(self, executor_id: str) -> None:
+        """Delete history in the caller's transaction, preserving orders and positions.
+
+        ExecutorOrder holds historical links, separate from the exchange Orders table.
+        The service locks and validates the executor before calling this method.
+        """
+        for model in (ExecutorOrder, ExecutorPerformanceSnapshot, ExecutorRecord):
+            await self.session.execute(delete(model).where(model.executor_id == executor_id))
 
     async def get_executors(
             self,

@@ -109,12 +109,14 @@ class TestGatewayConnectorFix:
         conn_setting = MagicMock()
         conn_setting.conn_init_parameters.return_value = {}
         service._conn_settings = {"binance": conn_setting}
+        service.binance_rate_limits = MagicMock()
+        exchange = MagicMock()
 
         with patch("services.unified_connector_service.BackendAPISecurity") as mock_security, \
                 patch("services.unified_connector_service.get_connector_class") as mock_class:
             mock_security.login_account = MagicMock()
             mock_security.api_keys = MagicMock(return_value={})
-            mock_class.return_value = MagicMock(return_value="binance-connector")
+            mock_class.return_value = MagicMock(return_value=exchange)
 
             connector = service._create_trading_connector(
                 account_name="master_account",
@@ -122,7 +124,11 @@ class TestGatewayConnectorFix:
             )
 
             assert not isinstance(connector, Gateway)
+            assert connector is exchange
             mock_class.assert_called_once_with("binance")
+            service.binance_rate_limits.install.assert_called_once_with(
+                "binance", exchange._web_assistants_factory, wait_on_cooldown=False
+            )
 
 
 class TestScriptConfigFix:
@@ -200,13 +206,14 @@ class TestLPExecutorRegistry:
 class TestGatewayIntegration:
     """Integration tests that require Gateway to be running.
 
-    These tests are skipped if Gateway is not available.
-    Run with: pytest test/test_gateway_lp_executor.py -v -m integration
+    Excluded from normal verification by pyproject.toml. Explicitly selecting
+    the integration marker requires a separately authorized live environment:
+    the executor test can place real trades.
     """
 
     @pytest.fixture
     def gateway_url(self):
-        return os.environ.get("GATEWAY_URL", "http://localhost:15888")
+        return os.environ.get("GATEWAY_URL", "https://localhost:15888")
 
     @pytest.fixture
     def api_url(self):

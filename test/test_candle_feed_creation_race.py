@@ -22,6 +22,10 @@ class FakeCandleFeed:
     """Candle feed stand-in whose validation yields to the loop, exposing the race window."""
 
     def __init__(self, config: CandlesConfig):
+        from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
+        from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
+
+        self._api_factory = WebAssistantsFactory(AsyncThrottler([]))
         self.config = config
         self.started = False
         self.stopped = False
@@ -60,6 +64,7 @@ class FakeCandlesFactory:
 def factory(monkeypatch):
     fake = FakeCandlesFactory()
     monkeypatch.setattr("services.market_data_service.CandlesFactory", fake)
+    monkeypatch.setattr("services.market_data_service.create_candle_feed", fake.get_candle)
     return fake
 
 
@@ -152,7 +157,7 @@ async def test_unused_feed_cleanup_prunes_the_lock(service, factory):
 async def test_stop_service_prunes_the_locks(service, factory):
     await service.get_candles_feed(CONFIG)
 
-    service.stop()
+    await service.stop()
 
     assert service._candle_feed_locks == {}
     assert service._candle_feeds == {}
@@ -172,3 +177,77 @@ async def test_a_held_lock_survives_pruning(service, factory):
 
     service._discard_candle_feed_lock(feed_key)
     assert feed_key not in service._candle_feed_locks
+
+
+async def test_validation_timeout_preserves_the_shared_connections(service, factory, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from config import settings
+
+    async def blocked_validation(*args):
+        await asyncio.Event().wait()
+
+    feed = factory.get_candle(CONFIG)
+    feed._api_factory.close = AsyncMock()
+    monkeypatch.setattr("services.market_data_service.create_candle_feed", lambda config: feed)
+    monkeypatch.setattr(service, "_validate_pair", blocked_validation)
+    monkeypatch.setattr(settings.market_data, "candles_ready_timeout", 0.02)
+    with pytest.raises(asyncio.TimeoutError):
+        await service.get_candles_feed(CONFIG)
+    feed._api_factory.close.assert_not_awaited()
+    assert not feed.started
+    assert service._candle_feeds == {}
+
+
+@pytest.mark.parametrize("stop_before_shutdown", ["none", "explicit", "janitor"])
+async def test_shutdown_waits_for_feed_websocket_disconnect(service, factory, stop_before_shutdown):
+    feed = await service.get_candles_feed(CONFIG)
+    listening = asyncio.Event()
+    disconnecting = asyncio.Event()
+    release_disconnect = asyncio.Event()
+
+    async def listen():
+        try:
+            listening.set()
+            await asyncio.Event().wait()
+        finally:
+            disconnecting.set()
+            await release_disconnect.wait()
+
+    feed._listen_candles_task = asyncio.create_task(listen())
+    listener = feed._listen_candles_task
+    await listening.wait()
+
+    def stop():
+        feed.stopped = True
+        # Match CandlesBase.stop_network(): the attribute no longer retains the
+        # cancelled task while its asynchronous WebSocket disconnect is running.
+        feed._listen_candles_task.cancel()
+        feed._listen_candles_task = None
+
+    feed.stop = stop
+    if stop_before_shutdown == "explicit":
+        service.stop_candle_feed(CONFIG)
+    elif stop_before_shutdown == "janitor":
+        for key in service._last_access_times:
+            service._last_access_times[key] = 0.0
+        service._cleanup_task = asyncio.create_task(service._cleanup_unused_feeds())
+        await disconnecting.wait()
+    shutdown = asyncio.create_task(service.stop())
+    await disconnecting.wait()
+    await asyncio.sleep(0)
+    assert not shutdown.done()
+    release_disconnect.set()
+    await shutdown
+    assert listener.done()
+    assert service._candle_stop_tasks == set()
+
+
+async def test_banned_live_feed_creation_fails_before_creating_a_feed(service, factory):
+    from services.binance_rate_limits import BinanceRateLimitError, BinanceRequestBudget
+
+    budget = service._binance_rate_limits._budgets["binance"] = BinanceRequestBudget(960, 60)
+    budget.block(120, 418)
+    with pytest.raises(BinanceRateLimitError):
+        await service.get_candles_feed(CONFIG)
+    assert factory.created == []

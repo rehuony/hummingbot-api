@@ -191,6 +191,7 @@ def _service(db, metadata):
     service.db_manager = MagicMock(get_session_context=db.session_context)
     service._executor_metadata = {"e-1": dict(metadata)}
     service._active_executors = {}
+    service._history_writes = {}
     service._lp_position_addresses = {}
     service._lp_rent_recorded = set()
     service._lp_rent_retry_after = {}

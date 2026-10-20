@@ -7,6 +7,7 @@ liquidity comparison meaningless.
 
 Run with: pytest test/test_ticker_sources.py -v
 """
+import asyncio
 from decimal import Decimal
 from typing import Any, Dict
 
@@ -415,6 +416,9 @@ class StubConnectorService:
     """Enough of UnifiedConnectorService for the on-demand ticker path."""
 
     def __init__(self, known=("bybit",)):
+        from services.binance_rate_limits import BinanceRateLimits
+
+        self.binance_rate_limits = BinanceRateLimits()
         self._known = set(known)
         self._data_connectors: Dict[str, Any] = {}
 
@@ -548,6 +552,28 @@ async def test_on_demand_connector_joins_background_collection(monkeypatch):
     service = make_service(monkeypatch, fetch)
     await service.fetch_connector_tickers("bybit")
     assert "bybit" in service._connected_connector_names()
+
+
+async def test_background_and_on_demand_share_one_ticker_request(monkeypatch):
+    calls = []
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def fetch(connector, connector_name, *, raise_on_error=False):
+        calls.append(connector_name)
+        entered.set()
+        await release.wait()
+        return {"BTC-USDT": Ticker(price=Decimal("100"), timestamp=1.0)}
+
+    service = make_service(monkeypatch, fetch)
+    request = asyncio.create_task(service.fetch_connector_tickers("bybit"))
+    await entered.wait()
+    requested_at = service._ticker_requests["bybit"]
+    background = asyncio.create_task(service._collect_all_tickers())
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.gather(request, background)
+    assert calls == ["bybit"]
+    assert service._ticker_requests["bybit"] == requested_at
 
 
 def test_is_more_liquid_prefers_known_and_larger_quote_volume():

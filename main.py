@@ -4,7 +4,6 @@ from contextlib import asynccontextmanager
 from typing import Annotated
 from urllib.parse import urlparse
 
-import logfire
 from dotenv import load_dotenv
 
 # Apply the patch before importing hummingbot components
@@ -27,6 +26,10 @@ def patched_save_to_yml(yml_path, cm):
 
 
 config_helpers.save_to_yml = patched_save_to_yml
+
+from utils.client_order_ids import install_client_order_id_compatibility  # noqa: E402
+
+install_client_order_id_compatibility()
 
 from fastapi import Depends, FastAPI, HTTPException, status  # noqa: E402
 from fastapi.exceptions import RequestValidationError  # noqa: E402
@@ -73,13 +76,13 @@ from services.gateway_clmm_service import GatewayCLMMService  # noqa: E402
 from services.gateway_service import GatewayService  # noqa: E402
 from services.gateway_swap_service import GatewaySwapService  # noqa: E402
 from services.market_data_service import MarketDataService  # noqa: E402
-from services.self_upgrade import SelfUpgradeService  # noqa: E402
 from services.trading_history_service import TradingHistoryService  # noqa: E402
 from services.trading_service import TradingService  # noqa: E402
 from services.unified_connector_service import UnifiedConnectorService  # noqa: E402
 from services.websocket_manager import WebSocketManager  # noqa: E402
 from utils.bot_archiver import BotArchiver  # noqa: E402
 from utils.core_compatibility import require_core_surface  # noqa: E402
+from utils.exchange_connections import exchange_connections  # noqa: E402
 from utils.security import BackendAPISecurity  # noqa: E402
 from utils.validation_errors import validation_exception_handler  # noqa: E402
 
@@ -102,14 +105,21 @@ security = HTTPBasic()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Configure the shared exchange transport before startup and release it only
+    # after services have drained their requests and WebSocket listener tasks.
+    async with exchange_connections():
+        async with _service_lifespan(app):
+            yield
+
+
+@asynccontextmanager
+async def _service_lifespan(app: FastAPI):
     """
     Lifespan context manager for the FastAPI application.
     Handles startup and shutdown events.
     """
-    # The installed core is unpinned (see environment.yml), so check it carries the
-    # fields this API reads before anything reads them — the read path substitutes
-    # zeros for a missing attribute and logs at DEBUG, which turns a wrong install
-    # into silently zeroed accounting rather than a failure.
+    # Apply the explicit Hummingbot compatibility requirements, if any. The current
+    # requirement list is empty and does not require a patched or unreleased core.
     require_core_surface()
 
     # SEC-018: warn loudly if USERNAME/PASSWORD/CONFIG_PASSWORD are still the insecure defaults
@@ -216,9 +226,6 @@ async def lifespan(app: FastAPI):
         ticker_max_age=settings.market_data.ticker_max_age,
         ticker_subscription_ttl=settings.market_data.ticker_subscription_ttl,
     )
-    # Connector trade-volume telemetry resolves rates through the ticker pool instead of the
-    # legacy RateOracle singleton.
-    connector_service.set_rate_provider(market_data_service)
     logging.info("MarketDataService initialized")
 
     # TradingService - order placement, positions, trading interfaces
@@ -307,18 +314,6 @@ async def lifespan(app: FastAPI):
     else:
         logging.info("Gateway container not running; status monitor deferred until it is started")
 
-    # An upgrade started by the *previous* API process outlives it: the helper container
-    # that ran `docker compose up` is still on the box with its exit code and logs, and
-    # this process is the new container it created. Collect that record now, before
-    # anything can ask for it, and remove the helper so the next preflight is not blocked
-    # by its own predecessor. Never raises (FEAT-122).
-    self_upgrade_service = SelfUpgradeService(
-        docker_service=docker_service,
-        executor_service=executor_service,
-        bots_orchestrator=bots_orchestrator,
-    )
-    self_upgrade_service.collect_on_boot()
-
     bot_archiver = BotArchiver(
         settings.aws.api_key,
         settings.aws.secret_key,
@@ -368,7 +363,6 @@ async def lifespan(app: FastAPI):
     app.state.backtesting_service = backtesting_service
     app.state.bots_orchestrator = bots_orchestrator
     app.state.docker_service = docker_service
-    app.state.self_upgrade_service = self_upgrade_service
     app.state.gateway_service = gateway_service
     app.state.bot_archiver = bot_archiver
 
@@ -391,7 +385,7 @@ async def lifespan(app: FastAPI):
     await bots_orchestrator.stop()
     await accounts_service.stop()
     await executor_service.stop()
-    market_data_service.stop()
+    await market_data_service.stop()
     await connector_service.stop_all()
     GatewayHttpClient.get_instance().stop_monitor()
     docker_service.cleanup()
@@ -426,10 +420,6 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
-
-logfire.configure(send_to_logfire="if-token-present", environment=settings.app.logfire_environment,
-                  service_name="hummingbot-api")
-logfire.instrument_fastapi(app)
 
 
 def auth_user(

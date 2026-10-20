@@ -1,12 +1,4 @@
-"""A core older than this API must stop the boot, not quietly zero the books.
-
-``environment.yml`` installs hummingbot unpinned because the fields this API reads are
-not in a release yet, so a machine can very reasonably end up with an older core. The
-read path in ``_persist_executor_completed`` wraps every figure in one broad
-``except Exception`` that logs at DEBUG and substitutes ``Decimal("0")`` — so on an old
-core the API does not fail, it books every executor's pnl, fees, filled amount and
-volume as zero and never says why. That is the failure these tests exist to prevent.
-"""
+"""The optional core compatibility guard reports missing fields and accepts an empty list."""
 from types import SimpleNamespace
 
 import pytest
@@ -17,19 +9,12 @@ from utils.core_compatibility import REQUIRED_CORE_SURFACE, require_core_surface
 
 
 def test_the_installed_core_carries_everything_this_api_reads():
-    """Guards the real dependency: fails if the environment resolves an old core."""
+    """The installed package satisfies the current explicit requirements."""
     require_core_surface()
 
 
 def test_the_list_is_empty_because_nothing_extra_is_required_right_now():
-    """The guard stays; its contents do not.
-
-    It exists for a core field this API reads that a released hummingbot may not carry
-    yet. volume_traded_quote was the last such field and is gone — filled_amount_quote
-    means the volume traded on every executor type, LP included — so there is nothing
-    to require. An empty list is the honest state, and require_core_surface() passing
-    trivially is the point: no patched core needed to boot.
-    """
+    """The current release does not require a patched or unreleased core."""
     assert list(REQUIRED_CORE_SURFACE) == []
 
 

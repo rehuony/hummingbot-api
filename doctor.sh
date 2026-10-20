@@ -281,7 +281,7 @@ else
         if container_running "$cname"; then
             row ok "$label" "$cname — $(container_status "$cname")"
         else
-            row fail "$label" "container $cname is not running — the API needs it; \`make deploy\`, or \`docker compose up emqx postgres -d\` for a source run"
+            row fail "$label" "container $cname is not running — the API needs it; \`make deploy\`, or \`make run\` for a source run"
         fi
     done
 
@@ -317,7 +317,7 @@ echo ""
 
 section "Port exposure"
 
-# 5432/1883/18083 are bound to 127.0.0.1 in docker-compose.yml. An older
+# 1883/18083 bind to loopback; 5432 is published only for source mode. An older
 # deploy that has not been recreated since still has them on every interface,
 # and nothing about `docker compose ps` makes that visible.
 for entry in "5432:Postgres" "1883:EMQX MQTT" "18083:EMQX dashboard"; do

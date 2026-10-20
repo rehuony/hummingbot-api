@@ -1,6 +1,21 @@
-# Hummingbot API
+# Hummingbot API — personal edition
 
-A REST API for managing Hummingbot trading bots across multiple exchanges, with AI assistant integration via MCP.
+A REST API for my Hummingbot trading workflow across multiple exchanges, with AI assistant integration via MCP.
+
+This repository is independently maintained for **personal use**. Changes focus on my daily
+workflow, reliability, and privacy. External Issues, feature requests, pull requests, and
+community support are not accepted. Public visibility does not imply a support commitment.
+
+- **Maintained repository:** [rehuony/hummingbot-api](https://github.com/rehuony/hummingbot-api), branch [`main`](https://github.com/rehuony/hummingbot-api/tree/main).
+- **Original project:** [hummingbot/hummingbot-api](https://github.com/hummingbot/hummingbot-api).
+- **Verified development baseline:** [`7ae108f11bf20651682dbdff639a8717068c5883`](https://github.com/hummingbot/hummingbot-api/commit/7ae108f11bf20651682dbdff639a8717068c5883), committed **2026-10-15 17:01:44 UTC**, “Merge pull request #246 from hummingbot/fix/210-position-mode-no-pair”.
+  This is the parent of the existing customizations, confirmed by local history and reflog;
+  it was not selected from the latest upstream branch.
+- **License:** [MIT License](LICENSE), copyright © 2023 Hummingbot Foundation; original attribution is retained.
+
+There is no upstream synchronization, merge, or rebase workflow. The independence migration
+consolidates existing customizations once; subsequent work uses new focused commits and ordinary
+pushes to `origin/main`. See [maintenance and recovery](docs/maintenance.md) and [agent instructions](AGENTS.md).
 
 > **Why we recommend Tailscale for production**
 >
@@ -10,7 +25,7 @@ A REST API for managing Hummingbot trading bots across multiple exchanges, with 
 
 ## Quick Start
 
-**Recommended (Docker):** install from an empty directory with the [Hummingbot Deploy](https://github.com/hummingbot/deploy) helper script. **Docker** must be installed and running first.
+**Recommended (Docker):** clone this repository and build the API locally. **Git, Make, and Docker Compose** must be installed, and Docker must be running. No personal API image is published or required.
 
 ### Before you install (production)
 
@@ -20,28 +35,32 @@ For VPS or remote deployments, prepare Tailscale first:
 2. Generate a **reusable** auth key at [Settings → Keys](https://login.tailscale.com/admin/settings/keys) (starts with `tskey-auth-`)
 3. Enable **[MagicDNS](https://login.tailscale.com/admin/dns)** in the Tailscale admin console
 
-Full walkthrough: [hummingbot.org Tailscale guide](https://hummingbot.org/hummingbot-api/tailscale/) · [Securing Condor and Hummingbot API with Tailscale](https://hummingbot.org/blog/posts/securing-condor-and-hummingbot-api-with-tailscale/)
+Full walkthrough: [hummingbot.org Tailscale guide](https://hummingbot.org/hummingbot-api/tailscale/) · [Securing Condor and Hummingbot API with Tailscale](https://hummingbot.org/blog/securing-condor-and-hummingbot-api-with-tailscale/)
 
 ### Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hummingbot/deploy/main/setup.sh | bash -s -- --hummingbot-api
+git clone --branch main https://github.com/rehuony/hummingbot-api.git
+cd hummingbot-api
+make setup
+make build
+make deploy
 ```
 
-The script clones **`hummingbot-api`**, runs **`make setup`** (creates **`.env`**), pulls Compose images, and runs **`make deploy`**, which starts the **API**, **PostgreSQL**, and **EMQX** containers.
+Run these steps deliberately: `make setup` creates local configuration, `make build` builds
+`hummingbot-api-local:main` from this checkout, and `make deploy` starts/recreates the
+API, PostgreSQL, and EMQX services. Compose never pulls the API image from a registry.
+PostgreSQL, EMQX, and optional Tailscale still use their existing public images.
+Hummingbot core, Gateway, and MCP remain separate external dependencies.
 
 The setup script prompts for:
 
 - **Credentials** — API username/password (HTTP Basic Auth) and config password (encrypts bot credentials)
 - **Tailscale** — answer **`y`** when asked *Use Tailscale for secure private networking?* and paste your auth key (default hostname: **`hummingbot-api`**)
 
-If the script finishes but services did not start, run:
-
-```bash
-cd hummingbot-api
-make setup
-make deploy
-```
+For an existing installation, preserve `.env`, bot credentials, database volumes, and the
+Compose project name. Follow the [deployment transition](docs/maintenance.md#existing-installations)
+before its first deployment from `main`. Updating Git alone does not update a running service.
 
 ### Access the API
 
@@ -56,10 +75,11 @@ Use your API username and password for all requests. **Do not open port 8000 on 
 |---------|-------------|
 | `make setup` | Create `.env` file with configuration |
 | `make deploy` | Start all services (API, PostgreSQL, EMQX) |
-| `make stop` | Stop all services |
+| `make stop` | Stop base Compose services; a Tailscale overlay may need a separate stop |
 | `make run` | Run API locally in dev mode |
 | `make install` | Install conda environment for development |
-| `make build` | Build Docker image |
+| `make update` | Fast-forward a clean `main` from this repository’s `origin/main`; no deployment |
+| `make build` | Build the local API image from the checked-out source; no restart |
 | `make tailscale-status` | Show Tailscale connection + serve (proxy) status |
 | `make doctor` | Verify dependencies, `.env`, containers, port exposure and API access |
 
@@ -71,7 +91,7 @@ After hummingbot-api is running, these services are available:
 |---------|-----------|--------------------------------------|-------------|
 | **API** | http://localhost:8000 | http://hummingbot-api:8000 | REST API |
 | **Swagger UI** | http://localhost:8000/docs | http://hummingbot-api:8000/docs | Interactive API documentation |
-| **PostgreSQL** | localhost:5432 | — | Database |
+| **PostgreSQL** | Internal Docker network; localhost:5432 with `make run` | — | Database |
 | **EMQX** | 127.0.0.1:1883 | — | MQTT broker (auth required, loopback-only) |
 | **EMQX Dashboard** | http://127.0.0.1:18083 | — | Broker admin (`admin` / `BROKER_DASHBOARD_PASSWORD`) |
 
@@ -96,15 +116,21 @@ After hummingbot-api is running, these services are available:
 > the broker issue authenticated HTTP requests into internal services, and it survives
 > restarts. Use `make emqx-audit EMQX_CONTAINER=<name>` to check another deployment.
 
-> **Ports.** The API (`8000`) and Postgres (`5432`) also bind to `127.0.0.1` by default. Set
+> **Ports.** The API (`8000`) binds to `127.0.0.1` by default. Set
 > `API_BIND` in `.env` if something off-box must reach the API — prefer a specific interface
 > over `0.0.0.0`; with the Tailscale overlay, `API_BIND=<tailscale-ip>` keeps MagicDNS working
 > without publishing the API to the internet.
 
-PostgreSQL and EMQX are bound to `127.0.0.1` only — they're never reachable
-from another machine, on the tailnet or otherwise. Bot containers still reach
-them fine (they run with `network_mode: host`, so `127.0.0.1` is their host's
-loopback too).
+Docker deployments keep PostgreSQL on the internal Compose network. For source
+development, `make run` adds `docker-compose.source.yml` to publish PostgreSQL at
+`127.0.0.1:5432` (overridable with `DB_BIND`); the generated `DATABASE_URL` then
+works from host-run uvicorn. EMQX remains loopback-only. Bot containers reach the
+broker through host networking.
+
+`make run` explicitly selects the base and source Compose files. If you use a custom
+`docker-compose.override.yml` or `COMPOSE_FILE`, start the dependencies with those
+files plus `docker-compose.source.yml`, then start the local API with
+`conda run --no-capture-output -n hummingbot-api uvicorn main:app --reload`.
 
 ## Connect AI Assistant (MCP)
 
@@ -184,7 +210,7 @@ TAILSCALE_ENABLED=true
 TAILSCALE_AUTH_KEY=tskey-auth-...
 TAILSCALE_HOSTNAME=hummingbot-api   # MagicDNS hostname on your tailnet
 
-# Published-port bind addresses (both default to 127.0.0.1 in docker-compose.yml).
+# Published-port bind addresses (127.0.0.1 by default; DB_BIND is for make run only).
 # Widen API_BIND only if something off-box must reach the API directly — with the
 # Tailscale overlay, API_BIND=<tailscale-ip> keeps MagicDNS working without ever
 # publishing the API to the internet. See docker-compose.yml / docker-compose.tailscale.yml
@@ -197,7 +223,45 @@ list of every setting, its default and what it does. The `.env` that `setup.sh` 
 the optional `PERFORMANCE_`, `BACKTESTING_`, `MARKET_DATA_`, `CORS_` and `AWS_` groups as commented-out
 lines showing their defaults, so you can see and override them without leaving the file.
 
-Edit `.env` and restart with `make deploy` to apply changes.
+Apply intentional configuration changes with `make deploy`. This can recreate containers;
+it is separate from committing, pushing, or fetching source code.
+
+### Historical market data and Binance request limits
+
+Use `/market-data/historical-candles` for scans and research. It downloads REST pages
+without starting a live candle feed. Concurrent requests for the same market and
+interval-aligned window share one download; each response is trimmed to its requested
+start/end timestamps. At most four historical downloads run concurrently. The disk cache
+defaults to 128 ranges with a 15-second freshness bound, including forming candles:
+
+```bash
+#MARKET_DATA_HISTORICAL_CACHE_PATH=data/market_candles
+#MARKET_DATA_HISTORICAL_CACHE_ENTRIES=128
+#MARKET_DATA_HISTORICAL_CACHE_TTL_SECONDS=15.0
+```
+
+Set entries to zero to disable the cache. Failed or empty downloads are not cached.
+Live `/market-data/candles` requests continue to use managed WebSocket feeds.
+
+API-owned Binance connectors and candle feeds share a request-weight budget across
+accounts, separately for spot, USD-M futures and test/US domains. The budget uses 80%
+of the connector's configured IP allowance and retains its existing order throttles.
+Futures candle pages use at most 499 rows (weight 2); requests below 100 rows use weight 1.
+Bulk 24-hour ticker requests use weight 80 for spot and 40 for futures. The adapter preserves
+the historical endpoint's inclusive end timestamp across pages, including UTC calendar weeks
+and months.
+See Binance's [USD-M market data documentation](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data).
+
+HTTP 418/429 pauses the shared budget using `Retry-After` or the reported ban expiry.
+Background REST requests wait; historical callers receive HTTP 429 with `Retry-After`.
+High `X-MBX-USED-WEIGHT-1M` usage also pauses new requests, except on futures endpoints
+whose headers Binance documents as inaccurate. Do not immediately retry
+against the live-candles endpoint: it uses the same IP allowance.
+
+This coordination is scoped to one API process. Independent bots, backtest workers and
+scripts using Binance directly still consume the same egress IP's allowance; they must
+budget their own traffic or request historical data through this API. Successful response
+headers provide a brake for external usage, not a distributed reservation system.
 
 ## Secure Connection via Tailscale
 
@@ -233,13 +297,18 @@ TAILSCALE_HOSTNAME=hummingbot-api   # MagicDNS hostname on your tailnet
 make deploy
 ```
 
-When `TAILSCALE_ENABLED=true`, this automatically runs:
+`make deploy` checks the current host's tailnet state. If the host is already connected,
+it reuses that node and configures `tailscale serve`; otherwise it starts the sidecar:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.tailscale.yml up -d
 ```
 
-A Tailscale sidecar container joins your tailnet using `network_mode: host`. `hummingbot-api`'s port 8000 is bound to loopback only by default (`API_BIND` in `.env` — see [Configuration](#configuration)), so it does not sit on any public interface. The sidecar's `tailscale serve` config (`tailscale-serve.json`, applied automatically via `TS_SERVE_CONFIG` when the sidecar starts — no `tailscale serve` command needed) is what makes it reachable again: it forwards the tailnet IP's `:8000` to `127.0.0.1:8000`, so the API ends up reachable at `http://hummingbot-api:8000` from any device on the same tailnet, and *only* from the tailnet.
+In sidecar mode, a Tailscale container joins the tailnet using `network_mode: host`.
+The API's port 8000 remains bound to loopback by default (`API_BIND` in `.env`).
+`tailscale-serve.json` forwards the tailnet's port 8000 to `127.0.0.1:8000`.
+In host mode, the same forwarding uses the existing node's hostname. Run `make doctor`
+to verify the actual node name and forwarding; an occupied requested hostname may gain a suffix.
 
 ### Connecting MCP tools via Tailscale
 
@@ -311,7 +380,7 @@ it, then re-seed:
 ```bash
 make doctor                 # "Broker connection" says whether the API is connected
 docker compose logs emqx | grep -i "auth-bootstrap"
-make emqx-auth-reset        # rewrites the bootstrap file and re-seeds the broker
+# Inspect the logs before deciding whether credentials need rotation.
 ```
 A `Permission denied` on `/opt/emqx/etc/auth-bootstrap.csv` means the broker
 could not read the file it seeds the account from, so no account was ever
@@ -326,9 +395,11 @@ docker compose logs hummingbot-api
 
 **Database issues?**
 ```bash
-docker compose down -v    # Reset all data
-make deploy               # Fresh start
+docker compose logs postgres hummingbot-api
 ```
+Back up the database and inspect the error before making changes. Startup applies the schema
+steps in `database/connection.py`; a Git revert does not undo a database migration. Follow
+[recovery instructions](docs/maintenance.md#recovery) instead of deleting volumes.
 
 **Check service status:**
 ```bash
@@ -341,9 +412,23 @@ make tailscale-status     # Check tailnet peers
 ```
 Confirm the node appears in `tailscale status` and that MagicDNS is enabled in your Tailscale admin console.
 
-## Support
+## Privacy and local operation
 
-- **Docs**: https://hummingbot.org/hummingbot-api/
-- **Tailscale guide**: https://hummingbot.org/hummingbot-api/tailscale/
-- **API Docs**: http://localhost:8000/docs
-- **Issues**: https://github.com/hummingbot/hummingbot-api/issues
+The API does not initialize trade-volume telemetry or Logfire exporters. Bot configurations
+created by this API disable remote error reporting and anonymized trade-volume metrics, including
+when an old credential profile enables them. Existing running bots and their configurations are
+not changed by a Git update; redeploy them deliberately after reviewing their configuration.
+Local logs, authenticated health/resource endpoints, error messages, trading records, and
+performance analysis remain available. Optional S3 archives use the owner's configured bucket.
+
+There is no feedback UI, conversation-sharing service, or replacement feedback collector in this
+API. The official API image check and self-upgrade endpoints have been removed. Updates come
+from this repository and require an explicit local build and deployment.
+
+## Reference documentation
+
+- [Local API schema](http://localhost:8000/docs) — requires your API credentials.
+- [Maintenance, validation, deployment, and recovery](docs/maintenance.md).
+- [Original Hummingbot documentation](https://hummingbot.org/hummingbot-api/) and
+  [Tailscale guide](https://hummingbot.org/hummingbot-api/tailscale/) — external dependency
+  references; their installation and update instructions do not define this repository's workflow.

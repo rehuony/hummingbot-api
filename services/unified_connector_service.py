@@ -20,7 +20,6 @@ from hummingbot.client.config.config_crypt import ETHKeyFileSecretManger
 from hummingbot.client.config.config_helpers import ClientConfigAdapter, api_keys_from_connector_config_map, get_connector_class
 from hummingbot.client.settings import AllConnectorSettings
 from hummingbot.connector.connector_base import ConnectorBase
-from hummingbot.connector.connector_metrics_collector import TradeVolumeMetricCollector
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.gateway.gateway import Gateway
 from hummingbot.connector.perpetual_derivative_py_base import PerpetualDerivativePyBase
@@ -28,6 +27,7 @@ from hummingbot.core.data_type.common import OrderType, PositionAction, TradeTyp
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
 from hummingbot.core.utils.async_utils import safe_ensure_future
 
+from services.binance_rate_limits import BINANCE_CONNECTORS, BinanceRateLimits, background_binance_requests
 from services.perpetual_trading_service import sync_position_mode
 from utils.file_system import fs_util
 from utils.hummingbot_api_config_adapter import HummingbotAPIConfigAdapter
@@ -56,9 +56,6 @@ class UnifiedConnectorService:
     order_book_tracker running), falling back to data connector otherwise.
     """
 
-    METRICS_ACTIVATION_INTERVAL = Decimal("900")  # 15 minutes
-    METRICS_VALUATION_TOKEN = "USDT"
-
     def __init__(self, secrets_manager: ETHKeyFileSecretManger, db_manager=None):
         self.secrets_manager = secrets_manager
         self.db_manager = db_manager
@@ -67,27 +64,19 @@ class UnifiedConnectorService:
         self._trading_connectors: Dict[str, Dict[str, ConnectorBase]] = {}
 
         # Data-only connectors: connector_name -> ConnectorBase (shared, non-authenticated)
+        self.binance_rate_limits = BinanceRateLimits()
         self._data_connectors: Dict[str, ConnectorBase] = {}
         self._data_connectors_started: Dict[str, bool] = {}
 
         # Order and funding recorders (for trading connectors)
         self._orders_recorders: Dict[str, Any] = {}
         self._funding_recorders: Dict[str, Any] = {}
-        self._metrics_collectors: Dict[str, TradeVolumeMetricCollector] = {}
 
         # Locks to prevent race conditions in connector creation
         self._connector_locks: Dict[str, asyncio.Lock] = {}
 
         # Connector settings cache
         self._conn_settings = AllConnectorSettings.get_connector_settings()
-
-        # Rate provider for trade-volume telemetry (set to MarketDataService by main on startup).
-        # Exposes get_pair_rate(pair) -> Decimal, the RateOracle-compatible interface.
-        self._rate_provider = None
-
-    def set_rate_provider(self, rate_provider):
-        """Set the rate provider used by trade-volume telemetry (MarketDataService)."""
-        self._rate_provider = rate_provider
 
     def _is_perpetual_connector(self, connector: ConnectorBase) -> bool:
         """Check if connector is a perpetual derivative connector.
@@ -127,7 +116,6 @@ class UnifiedConnectorService:
         - API key authentication
         - Order tracking (OrdersRecorder)
         - Funding tracking for perpetuals (FundingRecorder)
-        - Metrics collection
         - Full trading capabilities
 
         Args:
@@ -250,7 +238,8 @@ class UnifiedConnectorService:
                 connector._trading_pairs.append(trading_pair)
 
             # Start network
-            await connector.start_network()
+            with background_binance_requests():
+                await connector.start_network()
             self._data_connectors_started[connector_name] = True
             logger.info(f"Started data connector: {connector_name} with pair {trading_pair}")
 
@@ -511,7 +500,8 @@ class UnifiedConnectorService:
                 if trading_pair not in tracker._trading_pairs:
                     tracker._trading_pairs.append(trading_pair)
 
-                tracker.start()
+                with background_binance_requests():
+                    tracker.start()
                 try:
                     await asyncio.wait_for(tracker.wait_ready(), timeout=30.0)
                     logger.info(f"Order book tracker ready for {type(connector).__name__}")
@@ -675,6 +665,7 @@ class UnifiedConnectorService:
         connector_name: str
     ) -> ConnectorBase:
         """Create and fully initialize a trading connector."""
+        self.binance_rate_limits.raise_if_blocked(connector_name)
         # Authenticate and create connector
         connector = self._create_trading_connector(account_name, connector_name)
 
@@ -709,9 +700,6 @@ class UnifiedConnectorService:
                 funding_recorder = FundingRecorder(self.db_manager, account_name, connector_name)
                 funding_recorder.start(connector)
                 self._funding_recorders[cache_key] = funding_recorder
-
-        # Initialize metrics
-        self._initialize_metrics(connector, account_name, connector_name, cache_key)
 
         # Start network tasks
         await self._start_connector_network(connector)
@@ -765,7 +753,9 @@ class UnifiedConnectorService:
         )
 
         connector_class = get_connector_class(connector_name)
-        return connector_class(**init_params)
+        connector = connector_class(**init_params)
+        self._install_binance_policy(connector_name, connector)
+        return connector
 
     def _create_data_connector(self, connector_name: str) -> ConnectorBase:
         """Create a non-authenticated data connector."""
@@ -796,9 +786,18 @@ class UnifiedConnectorService:
 
         connector_class = get_connector_class(connector_name)
         connector = connector_class(**init_params)
+        self._install_binance_policy(connector_name, connector)
 
         logger.info(f"Created data connector: {connector_name}")
         return connector
+
+    def _install_binance_policy(self, connector_name, connector):
+        if connector_name in BINANCE_CONNECTORS:
+            # Startup and request handlers share these connectors. A cooldown must
+            # fail their request promptly instead of suspending the entire API.
+            self.binance_rate_limits.install(
+                connector_name, connector._web_assistants_factory, wait_on_cooldown=False
+            )
 
     # =========================================================================
     # Network and State Management
@@ -809,25 +808,28 @@ class UnifiedConnectorService:
         try:
             await self._stop_connector_network(connector)
 
-            # Gateway/AMM connectors use start_network() instead of individual polling tasks
-            if hasattr(connector, '_trading_rules_polling_loop'):
-                connector._trading_rules_polling_task = safe_ensure_future(
-                    connector._trading_rules_polling_loop()
-                )
-            if hasattr(connector, '_trading_fees_polling_loop'):
-                connector._trading_fees_polling_task = safe_ensure_future(
-                    connector._trading_fees_polling_loop()
-                )
-            if hasattr(connector, '_create_user_stream_tracker_task'):
-                connector._user_stream_tracker_task = connector._create_user_stream_tracker_task()
-            if hasattr(connector, '_user_stream_event_listener'):
-                connector._user_stream_event_listener_task = safe_ensure_future(
-                    connector._user_stream_event_listener()
-                )
-            if hasattr(connector, '_lost_orders_update_polling_loop'):
-                connector._lost_orders_update_task = safe_ensure_future(
-                    connector._lost_orders_update_polling_loop()
-                )
+            # Child tasks inherit the cooldown wait scope; startup/request callers
+            # using the same connector keep failing promptly during a ban.
+            with background_binance_requests():
+                # Gateway/AMM connectors use start_network() instead of individual polling tasks
+                if hasattr(connector, '_trading_rules_polling_loop'):
+                    connector._trading_rules_polling_task = safe_ensure_future(
+                        connector._trading_rules_polling_loop()
+                    )
+                if hasattr(connector, '_trading_fees_polling_loop'):
+                    connector._trading_fees_polling_task = safe_ensure_future(
+                        connector._trading_fees_polling_loop()
+                    )
+                if hasattr(connector, '_create_user_stream_tracker_task'):
+                    connector._user_stream_tracker_task = connector._create_user_stream_tracker_task()
+                if hasattr(connector, '_user_stream_event_listener'):
+                    connector._user_stream_event_listener_task = safe_ensure_future(
+                        connector._user_stream_event_listener()
+                    )
+                if hasattr(connector, '_lost_orders_update_polling_loop'):
+                    connector._lost_orders_update_task = safe_ensure_future(
+                        connector._lost_orders_update_polling_loop()
+                    )
 
             # For gateway connectors, call start_network() which handles chain/network detection
             if hasattr(connector, 'start_network') and not hasattr(connector, '_trading_rules_polling_loop'):
@@ -872,20 +874,22 @@ class UnifiedConnectorService:
         self,
         connector: ConnectorBase,
         connector_name: str,
-        account_name: str = None
+        account_name: str = None,
+        strict: bool = False,
     ):
         """Public API to refresh a single connector's state (balances, positions, orders).
 
         Delegates to the internal _update_connector_state implementation so callers
         in sibling services don't depend on the underscore-prefixed helper.
         """
-        await self._update_connector_state(connector, connector_name, account_name)
+        await self._update_connector_state(connector, connector_name, account_name, strict=strict)
 
     async def _update_connector_state(
         self,
         connector: ConnectorBase,
         connector_name: str,
-        account_name: str = None
+        account_name: str = None,
+        strict: bool = False,
     ):
         """Update connector state (balances, positions, orders).
 
@@ -909,6 +913,8 @@ class UnifiedConnectorService:
 
         except Exception as e:
             logger.error(f"Error updating connector state: {e}")
+            if strict:
+                raise
 
     async def update_all_trading_connector_states(self):
         """Update state for all trading connectors in parallel."""
@@ -1079,7 +1085,7 @@ class UnifiedConnectorService:
           the exchange confirms it, so a connector that failed to start can never
           cause a live order to be falsely reported as cancelled.
 
-        Returns a summary dict with counts for logging/telemetry.
+        Returns a summary dict with counts for local diagnostics.
         """
         summary = {"reconciled_terminal": 0, "still_open": 0, "unverified": 0, "skipped_connectors": 0}
         if not self.db_manager:
@@ -1269,44 +1275,6 @@ class UnifiedConnectorService:
         return mapping.get(order_state, "SUBMITTED")
 
     # =========================================================================
-    # Metrics
-    # =========================================================================
-
-    def _initialize_metrics(
-        self,
-        connector: ConnectorBase,
-        account_name: str,
-        connector_name: str,
-        cache_key: str
-    ):
-        """Initialize trade volume metrics collector."""
-        if cache_key in self._metrics_collectors:
-            return
-
-        if "_paper_trade" in connector_name:
-            return
-
-        try:
-            instance_id = f"{account_name}_hbotapi"
-            rate_provider = self._rate_provider
-            if rate_provider is None:
-                logger.debug(f"No rate provider set, skipping trade-volume metrics for {connector_name}")
-                return
-
-            metrics_collector = TradeVolumeMetricCollector(
-                connector=connector,
-                activation_interval=self.METRICS_ACTIVATION_INTERVAL,
-                rate_provider=rate_provider,
-                instance_id=instance_id,
-                valuation_token=self.METRICS_VALUATION_TOKEN
-            )
-            metrics_collector.start()
-            self._metrics_collectors[cache_key] = metrics_collector
-
-        except Exception as e:
-            logger.warning(f"Failed to init metrics for {connector_name}: {e}")
-
-    # =========================================================================
     # Credentials and Configuration
     # =========================================================================
 
@@ -1464,13 +1432,6 @@ class UnifiedConnectorService:
                 del self._funding_recorders[cache_key]
             except Exception as e:
                 logger.error(f"Error stopping funding recorder: {e}")
-
-        if cache_key in self._metrics_collectors:
-            try:
-                self._metrics_collectors[cache_key].stop()
-                del self._metrics_collectors[cache_key]
-            except Exception as e:
-                logger.error(f"Error stopping metrics: {e}")
 
         # Stop connector network
         if account_name in self._trading_connectors:
@@ -1659,7 +1620,8 @@ class UnifiedConnectorService:
 
             # Restart the tracker
             logger.info(f"Restarting order book tracker for {connector_name} with pairs: {trading_pairs}")
-            tracker.start()
+            with background_binance_requests():
+                tracker.start()
 
             # Wait for initialization
             try:

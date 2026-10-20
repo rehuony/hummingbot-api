@@ -1,0 +1,63 @@
+name: Verify
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Check installation and deployment configuration
+        env:
+          TAILSCALE_AUTH_KEY: unused-validation-key
+        run: |
+          bash -n setup.sh doctor.sh tailnet-state.sh
+          make --dry-run build update
+          python3 -m unittest test/test_source_update.py
+          touch .env
+          docker compose config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.source.yml config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.tailscale.yml config --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build the personal API without publishing
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          platforms: linux/amd64
+          tags: hummingbot-api-local:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Check Python syntax and undefined names
+        run: |
+          docker run --rm --network none --tmpfs /tmp \
+            --env PYTHONDONTWRITEBYTECODE=1 \
+            --mount type=bind,source="$PWD",target=/workspace,readonly \
+            --workdir /workspace --entrypoint python hummingbot-api-local:ci \
+            -m flake8 --select E9,F63,F7,F82 --exclude .git .
+
+      - name: Run tests without external network or deployment access
+        run: |
+          docker run --rm --network none --tmpfs /tmp \
+            --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/workspace \
+            --mount type=bind,source="$PWD",target=/workspace,readonly \
+            --workdir /workspace --entrypoint python hummingbot-api-local:ci \
+            -m pytest -q -p no:cacheprovider

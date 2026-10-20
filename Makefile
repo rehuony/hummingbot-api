@@ -1,8 +1,18 @@
-.PHONY: setup run deploy stop install uninstall build install-pre-commit tailscale-status doctor reset emqx-auth emqx-auth-reset emqx-audit
+.PHONY: setup run update deploy stop install uninstall build install-pre-commit tailscale-status doctor reset emqx-auth emqx-auth-reset emqx-audit
 
 SETUP_SENTINEL := .setup-complete
 
 setup: $(SETUP_SENTINEL)
+
+# Update source only. Building and deploying are separate, explicit operations.
+update:
+	@test "$$(git branch --show-current)" = main || { echo "Error: update requires the main branch."; exit 1; }
+	@test -z "$$(git status --porcelain)" || { echo "Error: commit or stash local changes before updating."; exit 1; }
+	@case "$$(git remote get-url origin)" in \
+	  https://github.com/rehuony/hummingbot-api|https://github.com/rehuony/hummingbot-api.git|git@github.com:rehuony/hummingbot-api.git|ssh://git@github.com/rehuony/hummingbot-api.git) ;; \
+	  *) echo "Error: origin must point to rehuony/hummingbot-api."; exit 1 ;; \
+	esac
+	git pull --ff-only origin main
 
 $(SETUP_SENTINEL):
 	chmod +x setup.sh
@@ -12,7 +22,7 @@ $(SETUP_SENTINEL):
 # When TAILSCALE_ENABLED=true: installs Tailscale if needed, connects, configures tailscale serve,
 # then binds uvicorn to 127.0.0.1 only (tailscale serve exposes port 8000 on the tailnet)
 run: emqx-auth
-	docker compose up emqx postgres -d
+	docker compose -f docker-compose.yml -f docker-compose.source.yml up emqx postgres -d
 	@set -a; [ -f .env ] && . ./.env; set +a; \
 	if [ "$${TAILSCALE_ENABLED:-false}" = "true" ]; then \
 		echo "[INFO] Tailscale mode: setting up Tailscale for source install..."; \
@@ -219,9 +229,9 @@ install-pre-commit:
 	conda run -n hummingbot-api pip install pre-commit
 	conda run -n hummingbot-api pre-commit install
 
-# Build Docker image
+# Build the personal API locally; this tag is never pulled from a registry.
 build:
-	docker build -t hummingbot/hummingbot-api:latest .
+	docker build -t hummingbot-api-local:main .
 
 # Reset to near-origin state:
 #   - stops Docker containers (with volume wipe) and/or source uvicorn if running

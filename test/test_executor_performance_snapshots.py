@@ -123,6 +123,7 @@ def _service(active=None, **kwargs):
     service.performance_retention_days = kwargs.pop("performance_retention_days", 0)
     service._active_executors = active or {}
     service._executor_metadata = kwargs.pop("metadata", {})
+    service._history_writes = {}
     return service
 
 

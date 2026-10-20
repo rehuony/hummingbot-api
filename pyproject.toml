@@ -17,6 +17,8 @@ combine_as_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["test"]
+addopts = "-m 'not integration'"
+markers = ["integration: requires live services and may place real trades; excluded from normal verification"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 

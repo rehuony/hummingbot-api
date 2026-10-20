@@ -321,6 +321,10 @@ class DockerService:
         conf_file_path = f"instances/{instance_name}/conf/conf_client.yml"
         client_config = fs_util.read_yaml_file(conf_file_path)
         client_config['instance_id'] = instance_name
+        # Enforce privacy for new instances even when their source profile predates
+        # this policy. Local logs, MQTT messages and persisted trade records remain enabled.
+        client_config['send_error_logs'] = False
+        client_config['anonymized_metrics_mode'] = 'anonymized_metrics_disabled'
 
         # SEC: the broker rejects anonymous connections (see the EMQX_AUTHENTICATION__* block in
         # docker-compose.yml), so every instance has to present the shared broker credentials —

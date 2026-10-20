@@ -39,7 +39,9 @@ pytest_cache/
 
 # Development files
 .env
-.env.local
+.env.*
+.emqx/
+.setup-complete
 *.log
 
 # Build artifacts
@@ -56,7 +58,10 @@ docker-compose*.yml
 bots/instances/*
 bots/data/*
 bots/credentials/*
-!bots/credentials/master_account/
+bots/gateway-files/
+bots/conf/
+data/
+gateway-files/
 
 # Archives
 bots/archived/

@@ -1,15 +1,4 @@
-"""
-Tests for the /system/info endpoint.
-
-The dashboard needs to tell which hummingbot-api and hummingbot version a server runs,
-and whether its image is the published one or something pinned on the box. That answer
-comes from the API's own container over the mounted docker.sock, which is exactly the
-thing that can be missing -- so pinned here: the happy path reports the digest and the
-compose labels, a locally built image and a compose override file each read as pinned,
-and a daemon that cannot be reached still answers with both versions.
-
-Run with: pytest test/test_system_info.py -v
-"""
+"""Local system information remains available without a registry or updater."""
 from types import SimpleNamespace
 
 import pytest
@@ -24,9 +13,9 @@ WORKING_DIR = "/home/hbot/hummingbot-api"
 
 
 def _container(
-    digests=("hummingbot/hummingbot-api@sha256:abc123",),
+    digests=("hummingbot-api-local@sha256:abc123",),
     config_files=f"{WORKING_DIR}/docker-compose.yml",
-    image="hummingbot/hummingbot-api:latest",
+    image="hummingbot-api-local:main",
     name="hummingbot-api",
     project="hummingbot-api",
 ):
@@ -112,80 +101,48 @@ def test_reports_versions_and_container(make_client):
     assert body["container"] == {
         "id": CONTAINER_ID,
         "name": "hummingbot-api",
-        "image": "hummingbot/hummingbot-api:latest",
+        "image": "hummingbot-api-local:main",
         "image_id": "sha256:deadbeef",
-        "digest": "hummingbot/hummingbot-api@sha256:abc123",
+        "digest": "hummingbot-api-local@sha256:abc123",
         "compose_project": "hummingbot-api",
         "compose_working_dir": WORKING_DIR,
         "compose_config_files": f"{WORKING_DIR}/docker-compose.yml",
     }
-    assert body["pinned"] is False
-    assert body["pinned_reason"] is None
-    assert body["override_file"] is None
+    assert "pinned" not in body
 
 
-def test_locally_built_image_is_pinned(make_client):
+def test_locally_built_image_without_a_digest_is_reported(make_client):
     body = make_client(_Client(_container(digests=()))).get("/system/info").json()
 
+    assert body["container"]["image"] == "hummingbot-api-local:main"
     assert body["container"]["digest"] is None
-    assert body["pinned"] is True
-    assert "locally" in body["pinned_reason"]
-    assert body["override_file"] is None
 
 
-def test_locally_built_image_on_the_containerd_store_is_pinned(make_client):
-    # The containerd image store gives a local build a RepoDigest of its own; it is not a
-    # digest in the published repository, so it does not make the image the published one.
-    sha = "sha256:f84fd1ab6802c4434a8ea709c63a7a99c30b4aaa80e828fc508d1ebb2e65f806"  # noqa: mock
-    container = _container(digests=(f"hbapi@{sha}",), image="hbapi:pr235")
+def test_containerd_local_digest_is_reported(make_client):
+    container = _container(digests=("hbapi@sha256:abc123",), image="hbapi:main")
+    body = make_client(_Client(container)).get("/system/info").json()
+
+    assert body["container"]["digest"] == "hbapi@sha256:abc123"
+
+
+def test_digest_from_another_repository_is_not_reported(make_client):
+    container = _container(digests=("another-api@sha256:abc123",))
     body = make_client(_Client(container)).get("/system/info").json()
 
     assert body["container"]["digest"] is None
-    assert body["pinned"] is True
-    assert "locally" in body["pinned_reason"]
 
 
-def test_a_fully_qualified_published_digest_is_the_published_image(make_client):
-    container = _container(digests=("docker.io/hummingbot/hummingbot-api@sha256:abc123",))
-    body = make_client(_Client(container)).get("/system/info").json()
+def test_compose_overlay_metadata_is_preserved(make_client):
+    config_files = f"{WORKING_DIR}/docker-compose.yml,{WORKING_DIR}/docker-compose.tailscale.yml"
+    body = make_client(_Client(_container(config_files=config_files))).get("/system/info").json()
 
-    assert body["container"]["digest"] == "docker.io/hummingbot/hummingbot-api@sha256:abc123"
-    assert body["pinned"] is False
-
-
-def test_a_version_tag_in_the_main_compose_file_is_pinned(make_client):
-    # Pulled from the registry, so it has a published digest -- but upgrading it would
-    # pull the same tag back, not latest.
-    container = _container(image="hummingbot/hummingbot-api:1.0.1")
-    body = make_client(_Client(container)).get("/system/info").json()
-
-    assert body["pinned"] is True
-    assert "1.0.1" in body["pinned_reason"]
-    assert body["override_file"] is None
+    assert body["container"]["compose_config_files"] == config_files
 
 
-def test_an_image_pinned_by_digest_is_pinned(make_client):
-    container = _container(image="hummingbot/hummingbot-api@sha256:abc123")
-    assert make_client(_Client(container)).get("/system/info").json()["pinned"] is True
-
-
-def test_override_file_is_pinned_and_named(make_client):
-    container = _container(
-        config_files=f"{WORKING_DIR}/docker-compose.yml,{WORKING_DIR}/docker-compose.override.yml",
-    )
-    body = make_client(_Client(container)).get("/system/info").json()
-
-    assert body["pinned"] is True
-    assert body["override_file"] == "docker-compose.override.yml"
-    assert "docker-compose.override.yml" in body["pinned_reason"]
-
-
-def test_extra_overlay_that_is_not_an_override_is_not_pinned(make_client):
-    # The Tailscale overlay repoints networking, not the image.
-    container = _container(
-        config_files=f"{WORKING_DIR}/docker-compose.yml,{WORKING_DIR}/docker-compose.tailscale.yml",
-    )
-    assert make_client(_Client(container)).get("/system/info").json()["pinned"] is False
+def test_self_upgrade_routes_are_absent(make_client):
+    client = make_client(_Client(_container()))
+    for method, url in (("GET", "/system/upgrade/preflight"), ("POST", "/system/upgrade"), ("GET", "/system/upgrade/status")):
+        assert client.request(method, url).status_code == 404
 
 
 def test_falls_back_to_the_compose_service_label(make_client):
@@ -210,13 +167,12 @@ def test_finds_itself_by_container_id_when_the_hostname_is_overridden(make_clien
 
 def test_two_candidates_for_the_service_label_report_no_container(make_client):
     # Another stack on the same host runs a hummingbot-api service too. Picking one would
-    # report its image and its pinning verdict as this server's.
+    # report its image as this server's.
     decoy = _container(name="decoy-api", project="some-other-stack", image="alpine:latest")
     body = make_client(_Client(_container(), found_by_hostname=False, others=[decoy])).get("/system/info").json()
 
     assert body["docker_available"] is True
     assert body["container"] is None
-    assert body["pinned"] is None
 
 
 def test_running_from_source_does_not_claim_a_container(make_client, inside_a_container):
@@ -229,7 +185,6 @@ def test_running_from_source_does_not_claim_a_container(make_client, inside_a_co
     body = make_client(client).get("/system/info").json()
 
     assert body["container"] is None
-    assert body["pinned"] is None
     assert client.containers.list_filters is None
 
 
@@ -238,8 +193,6 @@ def test_docker_unavailable_still_reports_versions(make_client):
 
     assert body["docker_available"] is False
     assert body["container"] is None
-    assert body["pinned"] is None
-    assert body["pinned_reason"] is None
     assert body["api_version"] == VERSION
     assert body["hummingbot_version"]
 
@@ -250,7 +203,6 @@ def test_container_not_identified_reports_no_container(make_client):
 
     assert body["docker_available"] is True
     assert body["container"] is None
-    assert body["pinned"] is None
     assert body["api_version"] == VERSION
 
 
@@ -276,16 +228,19 @@ def test_reports_the_market_data_tunables(make_client):
 
     body = make_client(_Client(_container())).get("/system/info").json()
 
-    assert body["market_data"] == settings.market_data.model_dump()
+    assert body["market_data"] == settings.market_data.model_dump(exclude={"historical_cache_path"})
     assert body["market_data"]["ticker_update_interval"] == settings.market_data.ticker_update_interval
 
 
-def test_market_data_tunables_carry_no_secret(make_client):
-    # MarketDataSettings is intervals and timeouts by construction. Pinned so a later
-    # field that does not belong in an unauthenticated-looking payload fails here first.
+def test_market_data_tunables_carry_no_secret(make_client, monkeypatch):
+    from config import settings
+
+    # Local cache paths are not part of the dashboard's numeric tuning contract.
+    monkeypatch.setattr(settings.market_data, "historical_cache_path", "/private/deployment/cache")
     body = make_client(_Client(_container())).get("/system/info").json()
 
     assert body["market_data"]
+    assert "historical_cache_path" not in body["market_data"]
     assert all(isinstance(v, (int, float)) for v in body["market_data"].values())
     assert not any(
         word in key.lower()

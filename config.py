@@ -43,6 +43,9 @@ class MarketDataSettings(BaseSettings):
         default=30,
         description="How long to wait for a candle feed to become ready in seconds"
     )
+    historical_cache_path: str = Field(default="data/market_candles", description="Bounded cache for REST historical candles")
+    historical_cache_entries: int = Field(default=128, ge=0, description="Maximum cached ranges; zero disables caching")
+    historical_cache_ttl_seconds: float = Field(default=15.0, ge=0, description="Freshness bound, including forming candles")
     ws_heartbeat_interval: int = Field(
         default=30,
         description="WebSocket heartbeat interval in seconds"
@@ -205,12 +208,6 @@ class AppSettings(BaseSettings):
     controllers_path: str = "bots/conf/controllers"
     controllers_module: str = "bots.controllers"
     password_verification_path: str = "credentials/master_account/.password_verification"
-
-    # Environment-configurable settings
-    logfire_environment: str = Field(
-        default="dev",
-        description="Logfire environment name"
-    )
 
     # Account state update interval
     account_update_interval: int = Field(
