@@ -35,8 +35,9 @@ make install
 conda run -n hummingbot-api pytest -q
 ```
 
-`make install` creates the environment if missing, installs the commit hooks, and runs
-interactive setup. It does not update an already existing environment. After an intentional
+`make install` creates the environment if missing and installs the commit hooks. Run
+`make setup` separately to initialize local configuration. Installation does not update
+an already existing environment. After an intentional
 dependency change, update it explicitly with `conda env update -n hummingbot-api -f environment.yml`.
 There is no tracked lockfile today. Do not invent a lockfile replacement or a private package
 source. Hummingbot core comes from PyPI; other channels and external images remain documented
@@ -70,22 +71,39 @@ checkout has advanced `main`, inspect the divergence and reconcile your work del
 make build
 ```
 
-This builds `hummingbot-api-local:main` from the current checkout using the existing
+This builds `rehuony/hummingbot-api:main` from the current checkout using the existing
 multi-stage Conda Dockerfile. It does not start or restart containers, run migrations,
 publish a package, or upload an image. Compose uses this local image with
 `pull_policy: never`; it cannot replace the personal API with an official image.
-There is no assumed `rehuony` image repository. Existing Hummingbot bot, Gateway, MCP,
-PostgreSQL, EMQX, and Tailscale images are separate dependencies.
+The name is a local tag, not a published registry release. Existing Hummingbot bot,
+Gateway, MCP, PostgreSQL, EMQX, and Tailscale images are separate dependencies.
+
+Each build records the source URL, full Git SHA, actual branch, working-tree modification
+state, and UTC build time. Dockerfile labels explicitly identify this project instead of
+inheriting the base image's title, version, source, revision, creation time, or license.
+`make image-info` inspects the image currently assigned to the local tag. A running
+container continues using its original immutable image until explicitly recreated;
+authenticated `GET /system/info` reports that image's metadata without network requests.
+Image IDs identify local images; registry digests may be absent for local builds and are
+never replaced with image IDs. The recorded build time is the UTC start of the build;
+Docker's image creation timestamp is reported separately and can retain a cached image timestamp.
+Missing or unrecognized build metadata is reported as unknown.
+
+Use `make build API_IMAGE=rehuony/hummingbot-api:verify` and
+`make image-info API_IMAGE=rehuony/hummingbot-api:verify` for an isolated validation tag.
+Build, inspection, and deployment all honor `API_IMAGE` (shell override, then `.env`,
+then the default `rehuony/hummingbot-api:main`).
 
 CI runs on pushes to `main` and manual dispatch. It validates installation/deployment
-configuration, builds the Docker image, and runs offline tests and fatal Python lint
-checks in an isolated container. It does not publish images or deploy. Check the CI
-run for the exact published SHA before scheduling a deployment.
+configuration, builds `rehuony/hummingbot-api:ci`, and runs offline tests and fatal Python
+lint checks in an isolated container. It does not publish images or deploy. Check the
+CI run for the exact published SHA before scheduling a deployment.
 
 Useful local static checks include:
 
 ```bash
-bash -n setup.sh doctor.sh tailnet-state.sh
+for script in scripts/shell/*.sh scripts/shell/lib/*.sh; do bash -n "$script"; done
+shellcheck -x scripts/shell/*.sh scripts/shell/lib/*.sh
 git diff --check
 conda run -n hummingbot-api python -m compileall -q main.py config.py services routers utils models database
 conda run -n hummingbot-api flake8 --select E9,F63,F7,F82 .
@@ -133,7 +151,7 @@ database, `.env`, bot credentials, certificates, and other persistent state priv
 Existing running bot configurations may still enable remote reporting. The API disables
 it for newly generated instances; review and redeploy existing bots separately.
 `templates/master_account/conf_client.yml` supplies defaults for a new installation.
-`setup.sh` copies it only when the local profile is missing. The runtime
+[`scripts/shell/setup.sh`](../scripts/shell/setup.sh) copies it only when the local profile is missing. The runtime
 `bots/credentials/master_account/conf_client.yml` is ignored, so editing that profile
 does not become a source change or get overwritten by normal updates.
 
@@ -142,16 +160,32 @@ does not become a source change or get overwritten by normal updates.
 On an already migrated, clean deployment checkout:
 
 ```bash
+make check-update
 make update
-make build
 # Review the source/CI and prepare a database and configuration backup.
 make deploy
+make image-info
 make doctor
 ```
 
+`make help` lists available commands and their effects. `make check-update` validates
+`origin`, fetches `origin/main`, and compares it with the current checkout. It reports
+equal, behind, ahead, or diverged histories and any local modifications. It changes
+only Git remote metadata, leaving the current branch and working tree untouched.
+
+For a running API, authenticated `GET /system/update-check` compares its recorded build
+commit with `main` at `rehuony/hummingbot-api` through GitHub. It reports an update only
+when the remote commit descends from the clean running build. Modified builds, missing
+metadata, ahead or diverged histories, and network failures have explicit reasons.
+The check runs on request with a timeout; it does not update source, pull images,
+deploy, restart, or provide a self-upgrade endpoint. Condor's existing upgrade UI
+requires separate adaptation to this interface.
+
 `make update` fast-forwards source from this repository's `origin/main` only. It does not
 install dependencies, build, restart, or migrate anything. `make build` builds the image.
-`make deploy` starts or recreates services and may configure tailnet access. The API's
+`make deploy` checks configuration, builds current source, generates broker bootstrap
+credentials, then starts or recreates services and may configure tailnet access. Every
+invocation builds first; a build failure leaves running services unchanged. The API's
 startup calls `AsyncDatabaseManager.create_tables()` in `database/connection.py`,
 including its lightweight schema changes and removal of legacy Hummingbot tables.
 There is no separate Alembic migration command. Review this startup behavior and back up
@@ -163,6 +197,48 @@ A restart uses the container's current image and does not fetch or build new sou
 `make doctor` and local logs diagnose the running service without changing its data.
 None of these operations proves that another host has been updated.
 
+## Operational scripts and resource ownership
+
+Makefile targets delegate to `scripts/shell/`; reusable shell functions and their AWK
+parser live in `scripts/shell/lib/`. Python tools live in `scripts/python/`, and database
+initialization SQL lives in `scripts/sql/`. See the [script directory guide](../scripts/README.md)
+for entry points and naming conventions. Each entry point locates the checkout from its own path, so direct
+calls such as `bash /path/to/hummingbot-api/scripts/shell/setup.sh` work from another directory.
+External installers must use this new setup path. Setup only creates configuration;
+`make pull-bot-image` handles bot image preparation and `make deploy` builds the API.
+
+PostgreSQL publishing is part of `docker-compose.yml`; remove references to the former
+source overlay from local automation. Existing `.env` files remain valid with localhost
+defaults, and may explicitly set the variables listed in the
+[network guide](user-guide.md#network-bindings). Preserve the Compose project name and
+existing volume identities when moving a checkout. SQL initialization now mounts
+`scripts/sql/init-db.sql` and still runs only when PostgreSQL initializes a new data volume.
+
+`make stop` handles both the base stack and its Tailscale sidecar, even if Tailscale has
+subsequently been disabled in `.env`. It preserves persistent volumes. Lifecycle commands
+verify container checkout ownership and the project/resource labels of existing named
+volumes and networks before changing resources. A mismatch requires inspection, not
+renaming or deleting a foreign resource. External volumes and networks remain unmanaged.
+Lifecycle commands select the repository's
+Compose files and include `docker-compose.override.yml` when present. Review that override
+before deployment; `COMPOSE_FILE` is rejected to keep lifecycle operations on this stack.
+
+`make emqx-auth-reset` recreates the project's broker and removes its currently resolved
+`emqx-data` volume; it refuses external broker data and leaves historical volumes alone.
+`make reset` verifies teardown before removing
+local configuration and credential files. If Docker is unavailable, it refuses unless the
+operator explicitly selects `ALLOW_PARTIAL_RESET=1`; that option cannot claim Docker data
+was removed. Neither reset command is a routine validation or update step.
+
+A foreground development session tracks its supervisor and dedicated process group
+per checkout. Stopping it terminates its reload workers as well as its launcher.
+A surviving process group continues to block deployment and reset even if the supervisor
+has exited. An incomplete session record also blocks these operations; after a forced
+termination, verify that its workers have stopped before manually removing the record.
+Stop the session before resetting; reset never kills a process merely
+because its command contains `uvicorn main:app`. Other checkouts and their processes
+must remain untouched.
+
 ## Recovery
 
 Prefer a normal revert commit:
@@ -172,7 +248,6 @@ git revert <bad-commit>
 # Validate the revert.
 git push origin main
 # Deploy deliberately after reviewing schema compatibility and backups.
-make build
 make deploy
 ```
 

@@ -65,3 +65,6 @@ gateway-files/
 
 # Archives
 bots/archived/
+
+.dev-session/
+.codegraph/

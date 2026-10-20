@@ -10,6 +10,8 @@ class BrokerSettings(BaseSettings):
 
     host: str = Field(default="localhost", description="MQTT broker host")
     port: int = Field(default=1883, description="MQTT broker port")
+    bind: str = Field(default="127.0.0.1", description="Published broker bind address for host-network bots")
+    published_port: int = Field(default=1883, ge=1, le=65535, description="Published broker port for host-network bots")
     username: str = Field(default="admin", description="MQTT broker username")
     password: str = Field(default="password", description="MQTT broker password")
     performance_dump_interval: int = Field(default=5, description="Controller performance dump interval in minutes")

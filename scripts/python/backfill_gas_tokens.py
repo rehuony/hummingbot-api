@@ -14,17 +14,29 @@ Rows whose chain still resolves to "UNKNOWN" are left untouched and reported, so
 unmapped chain surfaces instead of being papered over.
 
 Usage:
-    conda run --no-capture-output -n hummingbot-api python -m scripts.backfill_gas_tokens --dry-run
-    conda run --no-capture-output -n hummingbot-api python -m scripts.backfill_gas_tokens
+    conda run --no-capture-output -n hummingbot-api python -m scripts.python.backfill_gas_tokens --dry-run
+    conda run --no-capture-output -n hummingbot-api python -m scripts.python.backfill_gas_tokens
 """
 import argparse
 import asyncio
 import logging
+import os
 import sys
+from pathlib import Path
 
-from config import settings
-from database.connection import AsyncDatabaseManager
-from database.repositories.gateway_clmm_repository import GatewayCLMMRepository
+from dotenv import load_dotenv
+
+# Direct and module execution use the checkout configuration regardless of cwd.
+# Importing this module for tests has no directory or environment side effects.
+if __name__ == "__main__":
+    repository = Path(__file__).resolve().parents[2]
+    os.chdir(repository)
+    sys.path.insert(0, str(repository))
+    load_dotenv(repository / ".env")
+
+from config import settings  # noqa: E402
+from database.connection import AsyncDatabaseManager  # noqa: E402
+from database.repositories.gateway_clmm_repository import GatewayCLMMRepository  # noqa: E402
 
 logger = logging.getLogger("backfill_gas_tokens")
 

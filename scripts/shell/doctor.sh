@@ -15,13 +15,17 @@
 
 set -uo pipefail
 
-cd "$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit 1
+# shellcheck source=scripts/shell/lib/common.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh" || exit 1
+# shellcheck source=scripts/shell/lib/tailnet-state.sh
+. "$REPO_ROOT/scripts/shell/lib/tailnet-state.sh"
 
-# Kept in step with the Makefile's EMQX_AUTH_FILE.
+# Keep this path aligned with the bootstrap writer in emqx.sh.
 EMQX_BOOTSTRAP=".emqx/auth-bootstrap.csv"
 # Defaults so `set -u` holds when there is no .env to read them from.
 BROKER_PASSWORD=""
 TS_ENABLED=""
+TS_MODE=none
 
 # ── Palette ──────────────────────────────────────────
 
@@ -78,27 +82,6 @@ row() {
     done < <(printf '%s\n' "$detail" | fold -s -w "$body" | sed -E 's/[[:space:]]+$//')
 }
 
-# ── .env access ──────────────────────────────────────
-
-# Read one KEY out of .env without executing it: `source`-ing a file whose
-# values may contain shell metacharacters (a password with parentheses is
-# enough) is a syntax error that silently drops every variable below it.
-env_get() {
-    local key="$1" line
-    [ -f .env ] || return 0
-    line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" .env 2>/dev/null | tail -1)" || return 0
-    [ -n "$line" ] || return 0
-    line="${line#*=}"
-    line="$(printf '%s' "$line" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
-    case "$line" in
-        \"*\") line="${line%\"}"; line="${line#\"}" ;;
-        \'*\') line="${line%\'}"; line="${line#\'}" ;;
-    esac
-    printf '%s' "$line"
-}
-
-has_cmd() { command -v "$1" >/dev/null 2>&1; }
-
 container_running() {
     docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$1"
 }
@@ -135,6 +118,16 @@ is_tailscale_ip() {
     [[ "$ip" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+\.[0-9]+$ ]] || return 1
     o1="${BASH_REMATCH[1]}"; o2="${BASH_REMATCH[2]}"
     [ "$o1" -eq 100 ] && [ "$o2" -ge 64 ] && [ "$o2" -le 127 ]
+}
+
+# Pass Basic credentials through stdin, not process arguments, and never proxy
+# these strictly local diagnostics through a user-configured HTTP proxy.
+api_curl_authenticated() {
+    local credentials
+    credentials="${HB_USERNAME}:${HB_PASSWORD}"
+    credentials=${credentials//\\/\\\\}
+    credentials=${credentials//\"/\\\"}
+    printf 'user = "%s"\n' "$credentials" | curl -q --noproxy '*' --config - "$@"
 }
 
 # ── Header ───────────────────────────────────────────
@@ -188,14 +181,20 @@ if [ ! -f .env ]; then
     ENV_OK=false
 else
     ENV_OK=true
+    if ! load_compose_settings || ! require_configuration; then
+        row fail ".env" "invalid operational configuration; repair the reported keys"
+        exit 1
+    fi
     row ok ".env" "present"
 
     HB_USERNAME="$(env_get USERNAME)"
     HB_PASSWORD="$(env_get PASSWORD)"
     HB_CONFIG_PASSWORD="$(env_get CONFIG_PASSWORD)"
-    TS_ENABLED="$(env_get TAILSCALE_ENABLED)"
-    TS_HOSTNAME="$(env_get TAILSCALE_HOSTNAME)"
-    BIND_HOST="$(env_get API_BIND)"
+    TS_MODE=$(tailnet_mode) || TS_MODE=invalid
+    TS_ENABLED=false
+    [ "$TS_MODE" = none ] || TS_ENABLED=true
+    TS_HOSTNAME="$TAILSCALE_HOSTNAME"
+    BIND_HOST="$API_BIND"
     BROKER_PASSWORD="$(env_get BROKER_PASSWORD)"
     GATEWAY_PASSPHRASE="$(env_get GATEWAY_PASSPHRASE)"
 
@@ -270,7 +269,7 @@ else
     # which is not something `docker ps | grep emqx` would ever find.
     if container_running hummingbot-api; then
         row ok "hummingbot-api" "$(container_status hummingbot-api)"
-    elif pgrep -f "uvicorn main[:]app" >/dev/null 2>&1; then
+    elif dev_session_active; then
         row ok "hummingbot-api" "running from source (uvicorn), not the Docker deploy"
     else
         row fail "hummingbot-api" "not running — start it with \`make deploy\` (Docker) or \`make run\` (source)"
@@ -317,25 +316,30 @@ echo ""
 
 section "Port exposure"
 
-# 1883/18083 bind to loopback; 5432 is published only for source mode. An older
-# deploy that has not been recreated since still has them on every interface,
-# and nothing about `docker compose ps` makes that visible.
-for entry in "5432:Postgres" "1883:EMQX MQTT" "18083:EMQX dashboard"; do
-    port="${entry%%:*}"; label="${entry#*:}"
+# Compare actual listeners with configured publications, including explicit wider binds.
+for entry in "${DB_PORT:-5432}|${DB_BIND:-127.0.0.1}|Postgres" \
+    "${BROKER_PUBLISHED_PORT:-1883}|${BROKER_BIND:-127.0.0.1}|EMQX MQTT" \
+    "${BROKER_DASHBOARD_PORT:-18083}|${BROKER_DASHBOARD_BIND:-127.0.0.1}|EMQX dashboard"; do
+    port="${entry%%|*}"; rest="${entry#*|}"
+    expected="$(normalize_bind "${rest%%|*}")"; label="${rest#*|}"
     binds="$(listening_binds "$port")"
     if [ -z "$binds" ]; then
-        row ok "$label ($port)" "not listening"
+        row warn "$label ($port)" "no host listener detected (Docker Desktop listeners may be inside its VM)"
         continue
     fi
-    public=""
+    mismatch=false
     while IFS= read -r bind; do
-        [ -n "$bind" ] || continue
-        if is_public_bind "$bind"; then public="$bind"; break; fi
+        actual="$(bind_host "$bind")"
+        actual="${actual#[}"; actual="${actual%]}"
+        [ "$actual" != '*' ] || actual=0.0.0.0
+        if [ "$actual" != "$expected" ]; then mismatch=true; fi
     done <<< "$binds"
-    if [ -n "$public" ]; then
-        row fail "$label ($port)" "bound to $public (all interfaces) — nothing external needs it. Recreate the stack with \`make deploy\` to pick up the loopback-only binding"
+    if [ "$mismatch" = true ]; then
+        row fail "$label ($port)" "listener differs from configured bind $expected; inspect before redeploying"
+    elif [ "$expected" = 127.0.0.1 ] || [ "$expected" = ::1 ]; then
+        row ok "$label ($port)" "matches configured loopback binding"
     else
-        row ok "$label ($port)" "127.0.0.1 only"
+        row warn "$label ($port)" "matches explicitly configured bind $expected"
     fi
 done
 
@@ -370,31 +374,10 @@ echo ""
 section "Tailscale"
 
 if [ "${TS_ENABLED:-}" != "true" ]; then
-    row ok "Tailscale" "not enabled (TAILSCALE_ENABLED is not true)"
+    row ok "Tailscale" "disabled (resolved mode=none)"
 else
-    # Report against the mode actually in force, resolved the same way
-    # `make deploy` resolves it -- .env records a preference, the live host
-    # decides. Reporting "check tailscale-serve.json is mounted" at someone
-    # running host mode, which has no sidecar and no serve JSON, is worse than
-    # saying nothing.
-    # shellcheck source=tailnet-state.sh
-    . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tailnet-state.sh"
-    # tailnet_mode reads the ENVIRONMENT; doctor deliberately never sources
-    # .env (a password containing shell metacharacters is enough to break
-    # that), so hand it the values env_get already parsed. Without this it
-    # sees nothing set and reports every install as the default mode.
-    # A rejected TAILSCALE_MODE must be reported as the error it is. Falling
-    # back to a default here would show a mode the deploy is going to refuse
-    # to run, sending someone to debug the wrong thing.
-    if ! TS_MODE="$(
-        export TAILSCALE_MODE="$(env_get TAILSCALE_MODE)" TAILSCALE_ENABLED="$TS_ENABLED"
-        tailnet_mode 2>/dev/null
-    )"; then
-        TS_MODE=""
-    fi
-
-    if [ -z "$TS_MODE" ]; then
-        row fail "Mode" "TAILSCALE_MODE=$(env_get TAILSCALE_MODE) is not one of none, host or sidecar — \`make deploy\` will refuse to run until this is corrected in .env"
+    if [ "$TS_MODE" = invalid ]; then
+        row fail "Mode" "TAILSCALE_MODE is not one of none, host or sidecar — \`make deploy\` will refuse to run until this is corrected in .env"
     elif [ "$TS_MODE" = none ]; then
         row warn "Mode" "TAILSCALE_ENABLED=true but TAILSCALE_MODE=none — nothing will put the API on the tailnet. Set TAILSCALE_MODE to host or sidecar, or TAILSCALE_ENABLED=false"
     elif [ "$TS_MODE" = host ]; then
@@ -473,36 +456,44 @@ echo ""
 # ── API reachability ─────────────────────────────────
 
 section "API"
+api_host="$(connect_host "${API_BIND:-127.0.0.1}")"
+probe_host="$api_host"
+case "$api_host" in *:*) api_host="[$api_host]" ;; esac
+api_url="http://$api_host:8000"
 
 if ! has_cmd curl; then
     row warn "Reachability" "skipped — curl is not installed"
 elif [ "$ENV_OK" != true ]; then
     row warn "Reachability" "skipped — no .env to read credentials from"
+elif ! local_probe_host "$probe_host"; then
+    row warn "Reachability" "skipped — API_BIND is not a verified local interface; no credentials sent"
 else
     # / is a deliberately public liveness endpoint (no auth_user dependency in main.py) --
     # it returns 200 to everyone, correct credentials, wrong credentials, or none at all.
     # Checking it here would validate nothing: use an actual protected route instead, so a
     # non-200 here means what it says (bad credentials) rather than being unreachable in
     # principle.
-    code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 8 \
-        -u "${HB_USERNAME}:${HB_PASSWORD}" http://localhost:8000/system/resources 2>/dev/null)"
+    code="$(api_curl_authenticated -s -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 8 \
+        "${api_url}/system/resources" 2>/dev/null)"
     case "$code" in
         200)
-            row ok "Authenticated request" "200 from http://localhost:8000/system/resources"
+            row ok "Authenticated request" "200 from ${api_url}/system/resources"
             # A 200 without credentials would mean auth is not being enforced.
-            anon="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 8 \
-                http://localhost:8000/system/resources 2>/dev/null)"
+            anon="$(curl -q --noproxy '*' -s -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 8 \
+                "${api_url}/system/resources" 2>/dev/null)"
             if [ "$anon" = "200" ]; then
                 row fail "Auth enforcement" "an unauthenticated request also returned 200 — the API is answering anyone who can reach the port"
-            else
+            elif [ "$anon" = 401 ] || [ "$anon" = 403 ]; then
                 row ok "Auth enforcement" "unauthenticated request rejected ($anon)"
+            else
+                row warn "Auth enforcement" "could not verify rejection (HTTP $anon)"
             fi
             # REST answering is not the same as the stack working: bot status, controller
             # reports and logs all arrive over MQTT. With the broker refusing the API, the
             # API stays 200-healthy while every deployed bot reports nothing at all, which
             # is a much harder symptom to trace back to the broker than a named check.
-            mqtt="$(curl -s --connect-timeout 3 --max-time 8 \
-                -u "${HB_USERNAME}:${HB_PASSWORD}" http://localhost:8000/bot-orchestration/mqtt 2>/dev/null)"
+            mqtt="$(api_curl_authenticated -s --connect-timeout 3 --max-time 8 \
+                "${api_url}/bot-orchestration/mqtt" 2>/dev/null)"
             if printf '%s' "$mqtt" | grep -q '"mqtt_connected"[[:space:]]*:[[:space:]]*true'; then
                 row ok "Broker connection" "the API is connected to the MQTT broker"
             elif printf '%s' "$mqtt" | grep -q '"mqtt_connected"'; then
@@ -515,10 +506,10 @@ else
             row fail "Authenticated request" "$code — the API is up but USERNAME/PASSWORD in .env do not match what it is running with. Restart it after changing them: \`make deploy\`"
             ;;
         000|"")
-            row fail "Authenticated request" "no response from http://localhost:8000/system/resources — the API is not listening. \`make deploy\` (Docker) or \`make run\` (source)"
+            row fail "Authenticated request" "no response from ${api_url}/system/resources — the API is not listening. \`make deploy\` (Docker) or \`make run\` (source)"
             ;;
         *)
-            row warn "Authenticated request" "unexpected HTTP $code from http://localhost:8000/system/resources — check \`docker compose logs hummingbot-api\`"
+            row warn "Authenticated request" "unexpected HTTP $code from ${api_url}/system/resources — check \`docker compose logs hummingbot-api\`"
             ;;
     esac
 fi

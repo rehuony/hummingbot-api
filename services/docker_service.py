@@ -329,11 +329,21 @@ class DockerService:
         # SEC: the broker rejects anonymous connections (see the EMQX_AUTHENTICATION__* block in
         # docker-compose.yml), so every instance has to present the shared broker credentials —
         # the credential templates under bots/credentials/ ship with empty mqtt_username/password.
-        # mqtt_host is deliberately left untouched: this container runs with network_mode="host"
-        # and must reach the broker on the host loopback, not at the compose DNS name the API uses.
         mqtt_bridge = client_config.get('mqtt_bridge') or {}
         mqtt_bridge['mqtt_username'] = settings.broker.username
         mqtt_bridge['mqtt_password'] = settings.broker.password
+        # Bots use the host network. Adapt only the default local endpoint to the
+        # published broker address; explicit profile endpoints remain authoritative.
+        mqtt_host = mqtt_bridge.get('mqtt_host', 'localhost')
+        default_host = mqtt_host in ('localhost', '127.0.0.1', '::1')
+        if default_host and mqtt_bridge.get('mqtt_port', 1883) in (1883, '1883'):
+            published_host = settings.broker.bind.strip('[]')
+            if published_host == '0.0.0.0':
+                published_host = '127.0.0.1'
+            elif published_host == '::':
+                published_host = '::1'
+            mqtt_bridge['mqtt_host'] = published_host
+            mqtt_bridge['mqtt_port'] = settings.broker.published_port
         client_config['mqtt_bridge'] = mqtt_bridge
 
         # SEC-048: point the instance at the secured (mTLS) Gateway and give it the shared

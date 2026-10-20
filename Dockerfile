@@ -52,5 +52,24 @@ EXPOSE 8000
 ENV PATH="/opt/conda/envs/hummingbot-api/bin:$PATH"
 ENV CONDA_DEFAULT_ENV=hummingbot-api
 
+# Override inherited base-image provenance, even for builds without metadata.
+# Keep these args late so a new build timestamp does not invalidate dependency layers.
+ARG VCS_REF=""
+ARG VCS_BRANCH=""
+ARG VCS_DIRTY=""
+ARG BUILD_DATE=""
+ARG API_VERSION=""
+LABEL maintainer="rehuony" \
+      org.opencontainers.image.title="Hummingbot API" \
+      org.opencontainers.image.description="REST API for Hummingbot trading workflows" \
+      org.opencontainers.image.source="https://github.com/rehuony/hummingbot-api" \
+      org.opencontainers.image.url="https://github.com/rehuony/hummingbot-api" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${API_VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      io.rehuony.hummingbot-api.branch="${VCS_BRANCH}" \
+      io.rehuony.hummingbot-api.dirty="${VCS_DIRTY}"
+
 # Run the application
 ENTRYPOINT ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends
 from config import settings
 from deps import get_docker_service
 from services.docker_service import DockerService
+from services.source_updates import check_source_update
 from utils.compose import describe_container, own_container
 from version import VERSION
 
@@ -136,3 +137,11 @@ async def get_system_info(docker_service: DockerService = Depends(get_docker_ser
         return info
 
     return info
+
+
+@router.get("/update-check")
+async def get_source_update_check(docker_service: DockerService = Depends(get_docker_service)):
+    """Check the running image's source against main without changing source or deployment."""
+    info = await get_system_info(docker_service)
+    container = info["container"]
+    return await check_source_update(container["build"] if container else None)

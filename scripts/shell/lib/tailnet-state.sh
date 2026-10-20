@@ -1,7 +1,7 @@
 #!/bin/bash
 # Who, if anyone, already owns this host's tailnet interface?
 #
-# Sourced by setup.sh (to pick a default mode) and by the Makefile (to enforce
+# Sourced by setup.sh (to pick a default mode) and lifecycle scripts (to enforce
 # one at deploy time). Prints exactly one word:
 #
 #   sidecar  our own hummingbot-tailscale container is running

@@ -63,7 +63,7 @@ def test_deployment_disables_reporting_for_existing_profiles(tmp_path, monkeypat
     assert deployed["db_mode"] == original["db_mode"]
     assert deployed["mqtt_bridge"]["mqtt_logger"] is True
     assert deployed["mqtt_bridge"]["mqtt_events"] is True
-    assert deployed["mqtt_bridge"]["mqtt_host"] == "localhost"
+    assert deployed["mqtt_bridge"]["mqtt_host"] == settings.broker.bind
     assert source.read_bytes() == source_bytes
     service.client.containers.run.assert_not_called()
 
@@ -79,7 +79,9 @@ def test_default_profile_uses_hummingbot_disabled_reporting_mode():
 @pytest.mark.parametrize("existing_profile", [False, True])
 def test_setup_seeds_only_missing_profiles_and_preserves_configuration(tmp_path, existing_profile):
     root = Path(__file__).resolve().parents[1]
-    shutil.copy(root / "setup.sh", tmp_path / "setup.sh")
+    (tmp_path / "scripts/shell/lib").mkdir(parents=True)
+    shutil.copy(root / "scripts/shell/setup.sh", tmp_path / "scripts/shell/setup.sh")
+    shutil.copy(root / "scripts/shell/lib/tailnet-state.sh", tmp_path / "scripts/shell/lib/tailnet-state.sh")
     shutil.copytree(root / "templates", tmp_path / "templates")
     environment_file = tmp_path / ".env"
     environment_file.write_text("EXISTING_CONFIGURATION=keep\n")
@@ -91,17 +93,16 @@ def test_setup_seeds_only_missing_profiles_and_preserves_configuration(tmp_path,
         profile.parent.mkdir(parents=True)
         profile.write_bytes(original_profile)
 
-    # Setup's dependency pass is skipped, and its image pull uses a local fake.
-    # The script must never contact Docker or install packages in this test.
+    # Setup is configuration-only, even when Docker and package tools are present.
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     docker = bin_dir / "docker"
-    docker.write_text("#!/bin/sh\nexit 0\n")
+    docker.write_text("#!/bin/sh\necho Unexpected Docker call >&2\nexit 97\n")
     docker.chmod(0o755)
     subprocess.run(
-        ["bash", str(tmp_path / "setup.sh")],
-        cwd=tmp_path,
-        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "HBAPI_SKIP_DEPS": "1"},
+        ["bash", str(tmp_path / "scripts/shell/setup.sh")],
+        cwd=tmp_path.parent,
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
         check=True,
         capture_output=True,
         text=True,

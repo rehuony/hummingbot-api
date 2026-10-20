@@ -23,7 +23,7 @@ from pydantic_settings import BaseSettings
 import config
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SETUP_SH = REPO_ROOT / "setup.sh"
+SETUP_SH = REPO_ROOT / "scripts/shell/setup.sh"
 
 # Groups added by READ-117: documented, but every line commented out, so a freshly generated
 # .env keeps producing exactly the settings config.py already applies.
@@ -129,11 +129,13 @@ class TestEnvTemplateMatchesConfig:
         assert "0 keeps everything forever" in retention_comment
 
 
-class TestReadmePointsAtConfig:
+class TestUserGuidePointsAtConfig:
     def test_configuration_section_names_config_py_as_authoritative(self):
-        """The README excerpt is curated, so it has to say where the full list lives."""
+        """The linked guide's curated excerpt must say where the full list lives."""
         readme = (REPO_ROOT / "README.md").read_text()
-        section = readme[readme.index("## Configuration"):]
+        assert "docs/user-guide.md" in readme
+        guide = (REPO_ROOT / "docs/user-guide.md").read_text()
+        section = guide[guide.index("## Configuration"):]
         section = section[: section.index("\n## ")]
         assert "`config.py`" in section
         assert "PERFORMANCE_RETENTION_DAYS" in section

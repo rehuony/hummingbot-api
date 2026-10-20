@@ -4,15 +4,28 @@ import os
 import re
 import socket
 
-# Compose service this API is deployed as, used to find our own container when the
-# hostname lookup fails (see own_container).
-COMPOSE_SERVICE = "hummingbot-api"
-
 # Compose stamps these on every container it creates; they say which project the API
 # belongs to and which files were used to bring it up.
 LABEL_PROJECT = "com.docker.compose.project"
 LABEL_WORKING_DIR = "com.docker.compose.project.working_dir"
 LABEL_CONFIG_FILES = "com.docker.compose.project.config_files"
+SOURCE_REPOSITORY = "https://github.com/rehuony/hummingbot-api"
+
+
+def _build_metadata(image_attrs):
+    """Read API provenance, excluding unrelated labels inherited from a base image."""
+    labels = (image_attrs.get("Config") or {}).get("Labels") or {}
+    source = labels.get("org.opencontainers.image.source")
+    if source != SOURCE_REPOSITORY:
+        return dict.fromkeys(("source", "revision", "branch", "created", "dirty"))
+    dirty = labels.get("io.rehuony.hummingbot-api.dirty")
+    return {
+        "source": source,
+        "revision": labels.get("org.opencontainers.image.revision") or None,
+        "branch": labels.get("io.rehuony.hummingbot-api.branch") or None,
+        "created": labels.get("org.opencontainers.image.created") or None,
+        "dirty": {"true": True, "false": False}.get(dirty),
+    }
 
 
 def _container_id_from_mountinfo():
@@ -36,31 +49,29 @@ def _in_container():
 def own_container(client):
     """Find the container this API process runs in.
 
-    Docker sets a container's hostname to its own short id, which is how a process
-    identifies itself from the inside; when the deployment overrides `hostname:` the id
-    is still in the mount table. Only when both miss, and only from inside a container,
-    fall back to the compose service label -- and only when exactly one container carries
-    it. A process running from source on the host is not any container, and with two
-    candidates picking one would report another deployment's image as ours:
-    None is the honest answer in both cases.
+    The mount table identifies this process even when its hostname is overridden.
+    Without that evidence, only an in-container Docker ID hostname is considered,
+    and the returned container must have that ID. Names and Compose service labels
+    can identify another deployment and are never sufficient evidence.
 
     Returns:
         A docker-py Container, or None when this process cannot be placed.
     """
-    for ref in (socket.gethostname(), _container_id_from_mountinfo()):
-        if not ref:
-            continue
-        try:
-            return client.containers.get(ref)
-        except Exception:
-            pass
     if not _in_container():
         return None
+    ref = _container_id_from_mountinfo()
+    if ref is None:
+        ref = socket.gethostname()
+        if not re.fullmatch(r"[0-9a-f]{12,64}", ref):
+            return None
     try:
-        matches = client.containers.list(filters={"label": f"com.docker.compose.service={COMPOSE_SERVICE}"})
+        container = client.containers.get(ref)
     except Exception:
         return None
-    return matches[0] if len(matches) == 1 else None
+    container_id = getattr(container, "id", None)
+    if not isinstance(container_id, str) or not re.fullmatch(r"[0-9a-f]{64}", container_id):
+        return None
+    return container if container_id.startswith(ref) else None
 
 
 def _repository(ref):
@@ -84,14 +95,17 @@ def describe_container(container):
 
     Returns:
         Dictionary with the container's id and name, the image reference it was started
-        from, the image id, an available digest matching that image repository, and the
-        three compose labels that say where the deployment lives. No registry is queried.
+        from, the image id, an available digest matching that image repository, the
+        running image's creation time and source-build labels, and its Compose metadata.
+        No registry is queried.
     """
     labels = container.labels or {}
+    # docker-py resolves this by the container's immutable image ID, not its mutable tag.
     image = container.image
+    image_attrs = image.attrs if image is not None else {}
     image_ref = container.attrs.get("Config", {}).get("Image")
     digests = [
-        digest for digest in ((image.attrs.get("RepoDigests") or []) if image is not None else [])
+        digest for digest in (image_attrs.get("RepoDigests") or [])
         if _repository(digest) == _repository(image_ref)
     ]
     return {
@@ -100,6 +114,8 @@ def describe_container(container):
         "image": image_ref,
         "image_id": image.id if image is not None else None,
         "digest": digests[0] if digests else None,
+        "image_created": image_attrs.get("Created"),
+        "build": _build_metadata(image_attrs),
         "compose_project": labels.get(LABEL_PROJECT),
         "compose_working_dir": labels.get(LABEL_WORKING_DIR),
         "compose_config_files": labels.get(LABEL_CONFIG_FILES),

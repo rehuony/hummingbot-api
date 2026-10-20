@@ -24,16 +24,25 @@ jobs:
         env:
           TAILSCALE_AUTH_KEY: unused-validation-key
         run: |
-          bash -n setup.sh doctor.sh tailnet-state.sh
-          make --dry-run build update
-          python3 -m unittest test/test_source_update.py
+          for script in scripts/shell/*.sh scripts/shell/lib/*.sh; do bash -n "$script"; done
+          shellcheck -S error scripts/shell/*.sh scripts/shell/lib/*.sh
+          make --dry-run build update check-update image-info
+          python3 -m venv "$RUNNER_TEMP/hbapi-checks"
+          "$RUNNER_TEMP/hbapi-checks/bin/pip" install pytest pytest-asyncio python-dotenv
+          "$RUNNER_TEMP/hbapi-checks/bin/python" -m pytest -q \
+            test/test_source_update.py test/test_build_image.py test/test_setup.py \
+            test/test_operations.py test/test_compose_ports.py \
+            test/test_resource_ownership.py test/test_dev_session.py test/test_dev_config.py
           touch .env
           docker compose config --quiet
-          docker compose -f docker-compose.yml -f docker-compose.source.yml config --quiet
           docker compose -f docker-compose.yml -f docker-compose.tailscale.yml config --quiet
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
+      - name: Collect build metadata
+        id: metadata
+        run: bash scripts/shell/build-image.sh --metadata >> "$GITHUB_OUTPUT"
 
       - name: Build the personal API without publishing
         uses: docker/build-push-action@v6
@@ -42,22 +51,28 @@ jobs:
           load: true
           push: false
           platforms: linux/amd64
-          tags: hummingbot-api-local:ci
+          tags: rehuony/hummingbot-api:ci
+          build-args: |
+            VCS_REF=${{ steps.metadata.outputs.revision }}
+            VCS_BRANCH=${{ steps.metadata.outputs.branch }}
+            VCS_DIRTY=${{ steps.metadata.outputs.dirty }}
+            BUILD_DATE=${{ steps.metadata.outputs.created }}
+            API_VERSION=${{ steps.metadata.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Check Python syntax and undefined names
         run: |
-          docker run --rm --network none --tmpfs /tmp \
+          docker run --rm --network none --tmpfs /tmp:exec \
             --env PYTHONDONTWRITEBYTECODE=1 \
             --mount type=bind,source="$PWD",target=/workspace,readonly \
-            --workdir /workspace --entrypoint python hummingbot-api-local:ci \
+            --workdir /workspace --entrypoint python rehuony/hummingbot-api:ci \
             -m flake8 --select E9,F63,F7,F82 --exclude .git .
 
       - name: Run tests without external network or deployment access
         run: |
-          docker run --rm --network none --tmpfs /tmp \
+          docker run --rm --network none --tmpfs /tmp:exec \
             --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/workspace \
             --mount type=bind,source="$PWD",target=/workspace,readonly \
-            --workdir /workspace --entrypoint python hummingbot-api-local:ci \
+            --workdir /workspace --entrypoint python rehuony/hummingbot-api:ci \
             -m pytest -q -p no:cacheprovider

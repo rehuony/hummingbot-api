@@ -2,7 +2,7 @@ services:
   hummingbot-api:
     container_name: hummingbot-api
     # Produced by `make build` from this checkout, never replaced by a registry image.
-    image: hummingbot-api-local:main
+    image: ${API_IMAGE:-rehuony/hummingbot-api:main}
     pull_policy: never
     restart: unless-stopped
     ports:
@@ -32,6 +32,10 @@ services:
     environment:
       # Override specific values for Docker networking
       - BROKER_HOST=emqx
+      - BROKER_PORT=1883
+      # Host-network bot containers use the published endpoint, not Compose DNS.
+      - BROKER_BIND=${BROKER_BIND:-127.0.0.1}
+      - BROKER_PUBLISHED_PORT=${BROKER_PUBLISHED_PORT:-1883}
       - DATABASE_URL=postgresql+asyncpg://hbot:hummingbot-api@postgres:5432/hummingbot_api
       # SEC-048: reach the secured Gateway container-to-container over the shared emqx-bridge
       # network (the Gateway container is attached to it on start). https + the 'gateway' cert SAN.
@@ -88,12 +92,10 @@ services:
       # Deny-by-default ACL, replacing the stock `{allow, all}` one.
       - ./emqx/acl.conf:/opt/emqx/etc/acl.conf:ro
     ports:
-      # SEC: loopback-only. Bot containers run with network_mode="host" and reach the
-      # broker at 127.0.0.1:1883; hummingbot-api reaches it in-network as emqx:1883.
-      # Neither path needs the broker published on a routable interface — and with the
-      # Tailscale overlay in play, 0.0.0.0 meant "reachable from the whole tailnet".
-      - "127.0.0.1:1883:1883"  # mqtt:tcp
-      - "127.0.0.1:18083:18083"  # http:dashboard
+      # Loopback by default; widen a bind address explicitly in .env when needed.
+      # Host-network bots use this published MQTT endpoint; the API uses emqx:1883.
+      - "${BROKER_BIND:-127.0.0.1}:${BROKER_PUBLISHED_PORT:-1883}:1883"  # mqtt:tcp
+      - "${BROKER_DASHBOARD_BIND:-127.0.0.1}:${BROKER_DASHBOARD_PORT:-18083}:18083"  # http:dashboard
       # 8883 (mqtt:ssl), 8083/8084 (mqtt:ws), 8081 (http:management) and 61613 (web-stomp)
       # are not used by this project — conf_client.yml sets mqtt_ssl: false and the API
       # speaks plain TCP MQTT. Left unpublished to keep the attack surface minimal.
@@ -120,9 +122,10 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
       # Init script as safety net - only runs on first initialization
-      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
-    # The containerised API reaches Postgres over emqx-bridge. Only `make run`
-    # publishes a host port, through docker-compose.source.yml.
+      - ./scripts/sql/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    ports:
+      # Native development uses this endpoint; the container API uses postgres:5432.
+      - "${DB_BIND:-127.0.0.1}:${DB_PORT:-5432}:5432"
     networks:
       - emqx-bridge
     healthcheck:
