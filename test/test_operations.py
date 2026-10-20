@@ -408,9 +408,21 @@ def test_native_session_guards_reset_and_terminates_only_owned_child(checkout):
 def test_doctor_runs_without_docker_cli(checkout):
     root, environment = checkout
     commands = Path(environment["CALL_LOG"]).parent / "bin"
-    (commands / "docker").unlink()
-    result = run(checkout, "doctor.sh", PATH=f"{commands}:/usr/bin:/bin")
+    isolated_commands = root.parent / "doctor-bin"
+    isolated_commands.mkdir()
+    # System bin directories may contain Docker on CI hosts. Allow only the
+    # report's utilities and mocked probes, leaving the original PATH untouched.
+    for name in ("bash", "dirname", "awk", "printenv", "tput", "seq", "fold", "sed", "grep", "tr", "head", "cat"):
+        executable = shutil.which(name)
+        if executable:
+            (isolated_commands / name).symlink_to(executable)
+    for name in ("curl", "tailscale", "lsof", "ss", "pgrep", "ip", "ifconfig"):
+        (isolated_commands / name).symlink_to(commands / name)
+    assert shutil.which("docker", path=environment["PATH"]) is not None
+    assert shutil.which("docker", path=str(isolated_commands)) is None
+    result = run(checkout, "doctor.sh", PATH=str(isolated_commands))
     assert result.returncode != 0
     assert "not found" in result.stdout
     assert "Configuration" in result.stdout
     assert "FixtureApiPassword1" not in result.stdout + result.stderr
+    assert not any(call[0] == "docker" for call in calls(checkout))
