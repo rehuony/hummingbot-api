@@ -207,11 +207,12 @@ calls such as `bash /path/to/hummingbot-api/scripts/shell/setup.sh` work from an
 External installers must use this new setup path. Setup only creates configuration;
 `make pull-bot-image` handles bot image preparation and `make deploy` builds the API.
 
-PostgreSQL publishing is part of `docker-compose.yml`; remove references to the former
-source overlay from local automation. Existing `.env` files remain valid with localhost
-defaults, and may explicitly set the variables listed in the
+PostgreSQL is reachable at `postgres:5432` on the Compose network and is not published
+to the host by `docker-compose.yml`. Existing `.env` files remain valid for container
+deployment; `DB_BIND` and `DB_PORT` alone no longer publish a port. Native development
+with `make run` requires a host-reachable database; see the explicit local override in the
 [network guide](user-guide.md#network-bindings). Preserve the Compose project name and
-existing volume identities when moving a checkout. SQL initialization now mounts
+existing volume identities when moving a checkout. SQL initialization mounts
 `scripts/sql/init-db.sql` and still runs only when PostgreSQL initializes a new data volume.
 
 `make stop` handles both the base stack and its Tailscale sidecar, even if Tailscale has

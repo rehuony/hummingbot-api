@@ -377,13 +377,15 @@ BROKER_USERNAME=admin
 BROKER_PASSWORD=$BROKER_PASSWORD
 BROKER_DASHBOARD_PASSWORD=$BROKER_DASHBOARD_PASSWORD
 
-# Host-run API connection. Compose uses postgres:5432 internally.
+# Host-run API connection; native development needs an explicit database mapping.
+# See docs/user-guide.md. Compose uses postgres:5432 internally.
 DATABASE_URL=postgresql+asyncpg://hbot:hummingbot-api@localhost:5432/hummingbot_api
 
 # Published ports (Compose). Bind to a specific interface for remote access.
 # Port values must be 1-65535. Changing DB_PORT or BROKER_PUBLISHED_PORT also
 # requires the corresponding DATABASE_URL or BROKER_PORT change for make run.
 API_BIND=127.0.0.1
+# Used only by the optional database override and native-development validation.
 DB_BIND=127.0.0.1
 DB_PORT=5432
 BROKER_BIND=127.0.0.1

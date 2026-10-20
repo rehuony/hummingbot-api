@@ -67,7 +67,7 @@ def test_default_compose_ports_are_local_and_internal_network_is_unchanged(compo
     config = compose_config(tailscale=tailscale)
     services = config["services"]
     assert published_ports(services["hummingbot-api"]) == {("127.0.0.1", 8000, 8000)}
-    assert published_ports(services["postgres"]) == {("127.0.0.1", 5432, 5432)}
+    assert not services["postgres"].get("ports")
     assert published_ports(services["emqx"]) == {
         ("127.0.0.1", 1883, 1883), ("127.0.0.1", 18083, 18083),
     }
@@ -107,7 +107,7 @@ def test_custom_host_ports_do_not_change_container_endpoints(compose_config):
     })
     services = config["services"]
     assert published_ports(services["hummingbot-api"]) == {("100.64.0.1", 8000, 8000)}
-    assert published_ports(services["postgres"]) == {("127.0.0.2", 15432, 5432)}
+    assert not services["postgres"].get("ports")
     assert published_ports(services["emqx"]) == {
         ("100.64.0.2", 2883, 1883), ("127.0.0.3", 28083, 18083),
     }

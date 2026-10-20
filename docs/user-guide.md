@@ -11,7 +11,7 @@ After hummingbot-api is running, these services are available:
 | --- | --- | --- | --- |
 | API | [localhost:8000](http://localhost:8000) | `http://hummingbot-api:8000` | REST API |
 | API documentation | [localhost:8000/docs](http://localhost:8000/docs) | `http://hummingbot-api:8000/docs` | Interactive API schema |
-| PostgreSQL | `127.0.0.1:5432` | — | Database |
+| PostgreSQL | — | — | Internal database at `postgres:5432` on the Compose network |
 | EMQX | `127.0.0.1:1883` | — | MQTT broker (authentication required) |
 | EMQX dashboard | [127.0.0.1:18083](http://127.0.0.1:18083) | — | Broker admin (`admin` / `BROKER_DASHBOARD_PASSWORD`) |
 
@@ -44,13 +44,14 @@ restarts. Use `make emqx-audit EMQX_CONTAINER=<name>` to check another deploymen
 
 ### Network bindings
 
-The main Compose file publishes all service ports on localhost by default. Configure
-bindings and host ports in `.env` when another interface or port is needed:
+The main Compose file publishes the API and broker ports on localhost by default.
+PostgreSQL has no host port mapping, so it can coexist with a host PostgreSQL service.
+Configure bindings and host ports in `.env` when another interface or port is needed:
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | `API_BIND` | `127.0.0.1` | API binding; port remains 8000 |
-| `DB_BIND`, `DB_PORT` | `127.0.0.1`, `5432` | PostgreSQL published endpoint |
+| `DB_BIND`, `DB_PORT` | `127.0.0.1`, `5432` | Optional native-development database mapping (requires the override below) |
 | `BROKER_BIND`, `BROKER_PUBLISHED_PORT` | `127.0.0.1`, `1883` | MQTT published endpoint |
 | `BROKER_DASHBOARD_BIND`, `BROKER_DASHBOARD_PORT` | `127.0.0.1`, `18083` | EMQX dashboard published endpoint |
 
@@ -65,10 +66,25 @@ of published ports. New bots with the default localhost MQTT endpoint use the co
 published endpoint; an explicitly customized profile endpoint is preserved. Source
 profiles and already running bots are not rewritten.
 
-`make run` uses the same Compose file for its dependencies. When changing the published
-database or MQTT endpoint, also set the local API's `DATABASE_URL` and `BROKER_HOST` /
-`BROKER_PORT` to that endpoint. The command validates these settings before starting
-containers; it does not add temporary port mappings or edit `.env`.
+`make run` runs the API on the host and requires a host-reachable database. To use the
+Compose database for native development, explicitly add this mapping to a local
+`docker-compose.override.yml`, which the Make commands already load:
+
+```yaml
+services:
+  postgres:
+    ports:
+      - "${DB_BIND:-127.0.0.1}:${DB_PORT:-5432}:5432"
+```
+
+If the host already uses port 5432, set `DB_PORT=15432` (or another unused port) and
+update `DATABASE_URL` to use the same host port. Setting `DB_BIND` / `DB_PORT` alone
+does not publish PostgreSQL. This override also applies to deployment while present;
+omit it for container-only database access.
+
+When changing the published MQTT endpoint, also set the local API's `BROKER_HOST` /
+`BROKER_PORT` to that endpoint. `make run` validates endpoint settings before starting
+containers; it does not add port mappings or edit `.env`.
 
 ## Configuration
 
@@ -83,7 +99,7 @@ logs, and database backups private. Key settings:
 | `GATEWAY_URL` | Gateway endpoint |
 | `DEBUG_MODE` | Development logging and reload |
 | `API_BIND` | API host binding; defaults to `127.0.0.1` |
-| `DB_BIND`, `DB_PORT` | PostgreSQL published endpoint for deployment and development |
+| `DB_BIND`, `DB_PORT` | Optional database mapping and native-development endpoint validation |
 | `BROKER_BIND`, `BROKER_PUBLISHED_PORT` | Host-network bot endpoint; Compose API uses `emqx:1883` internally |
 | `PERFORMANCE_EXECUTOR_SNAPSHOT_INTERVAL` | Live executor snapshot interval in seconds; default `60` |
 | `PERFORMANCE_RETENTION_DAYS` | Snapshot retention; `0` keeps all snapshots |

@@ -316,9 +316,9 @@ echo ""
 
 section "Port exposure"
 
-# Compare actual listeners with configured publications, including explicit wider binds.
-for entry in "${DB_PORT:-5432}|${DB_BIND:-127.0.0.1}|Postgres" \
-    "${BROKER_PUBLISHED_PORT:-1883}|${BROKER_BIND:-127.0.0.1}|EMQX MQTT" \
+# PostgreSQL is internal; a host database listener may belong to another service.
+# Compare broker listeners with configured publications, including explicit wider binds.
+for entry in "${BROKER_PUBLISHED_PORT:-1883}|${BROKER_BIND:-127.0.0.1}|EMQX MQTT" \
     "${BROKER_DASHBOARD_PORT:-18083}|${BROKER_DASHBOARD_BIND:-127.0.0.1}|EMQX dashboard"; do
     port="${entry%%|*}"; rest="${entry#*|}"
     expected="$(normalize_bind "${rest%%|*}")"; label="${rest#*|}"

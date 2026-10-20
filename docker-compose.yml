@@ -123,9 +123,7 @@ services:
       - postgres-data:/var/lib/postgresql/data
       # Init script as safety net - only runs on first initialization
       - ./scripts/sql/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
-    ports:
-      # Native development uses this endpoint; the container API uses postgres:5432.
-      - "${DB_BIND:-127.0.0.1}:${DB_PORT:-5432}:5432"
+    # The API connects over emqx-bridge at postgres:5432; no host port is needed.
     networks:
       - emqx-bridge
     healthcheck:
