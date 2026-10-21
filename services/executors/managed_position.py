@@ -119,7 +119,6 @@ class ManagedPositionExecutor(ExecutorBase):
         return {
             "group_id": self.group["id"],
             "level_id": self.config.level_id,
-            "mode": self.group["request"]["mode"],
             "pnl_complete": all(order.get("fees_complete", True) for order in self.leg["orders"]),
             "management_status": self.group["status"],
             "remaining_amount": str(values["remaining"]),

@@ -15,7 +15,7 @@ class RevisionConflict(RuntimeError):
 
 def active_position_key(group):
     request = group["request"]
-    if request["mode"] != "live" or group["status"] in ("CLOSED", "DETACHED", "FAILED"):
+    if group["status"] in ("CLOSED", "DETACHED", "FAILED"):
         return None
     identity = [request[key] for key in ("account_name", "connector_name", "trading_pair")]
     return hashlib.sha256(json.dumps(identity).encode()).hexdigest()

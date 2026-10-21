@@ -20,7 +20,6 @@ class PositionGroupRequest(BaseModel):
     tp2_price: Decimal = Field(gt=0)
     margin: Decimal = Field(gt=0)
     leverage: Literal[10] = 10
-    mode: Literal["dry_run", "live"] = "dry_run"
     entry_expires_at: float = Field(gt=0)
 
     @model_validator(mode="after")

@@ -23,7 +23,6 @@ def request_data():
         "tp2_price": "110",
         "margin": "10",
         "leverage": 10,
-        "mode": "live",
         "entry_expires_at": 2000,
     }
 
@@ -156,15 +155,6 @@ async def test_unknown_unsafe_or_busy_account_blocks_before_any_write(request_da
         await service(connector).prepare_live(request_data)
     assert connector.writes == []
     assert "signed-url-secret" not in error.value.detail
-
-
-async def test_dry_run_cannot_configure_even_an_empty_account(request_data, connector):
-    request_data["mode"] = "dry_run"
-    with pytest.raises(RiskError):
-        await service(connector).prepare_live(request_data)
-    assert connector.reads == [] and connector.writes == []
-    await service(connector).quote(request_data)
-    assert connector.writes == []
 
 
 @pytest.mark.parametrize(

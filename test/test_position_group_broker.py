@@ -12,7 +12,7 @@ from services.executors.risk import RiskError
 
 @pytest.fixture
 def request_data():
-    return {"mode": "live", "connector_name": "binance_perpetual", "trading_pair": "ETH-USDT", "side": "long"}
+    return {"connector_name": "binance_perpetual", "trading_pair": "ETH-USDT", "side": "long"}
 
 
 @pytest.fixture
@@ -189,14 +189,6 @@ async def test_close_reduces_correct_position_without_opening_the_opposite_side(
         assert sent["positionSide"] == "LONG" and "reduceOnly" not in sent
     else:
         assert sent["reduceOnly"] == "true" and "positionSide" not in sent
-
-
-@pytest.mark.parametrize("method", ["submit", "cancel"])
-async def test_dry_run_never_reaches_a_connector_write(request_data, order, exchange, method):
-    request_data["mode"] = "dry_run"
-    with pytest.raises(RiskError):
-        await getattr(broker(exchange), method)(request_data, order)
-    assert exchange.posts == [] and exchange.deletes == [] and exchange.queries == []
 
 
 async def test_cancel_ack_lost_with_fill_winning_preserves_fill(request_data, order, exchange):

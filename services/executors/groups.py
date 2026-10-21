@@ -14,7 +14,6 @@ from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
 
 from models.position_groups import PositionGroupRequest
-from services.executors.dry_run import DryRunBroker
 from services.executors.managed_position import (
     TERMINAL_ORDERS,
     ManagedPositionConfig,
@@ -50,7 +49,6 @@ class PositionGroupService:
         self.store = store
         self.risk = risk
         self.broker = broker
-        self.paper = DryRunBroker(broker.price)
         self.executor_service = executor_service
         self.clock = clock
         self.interval = interval
@@ -76,15 +74,11 @@ class PositionGroupService:
             "protocol_version": 1,
             "executor_type": "managed_position_executor",
             "connectors": ["binance_perpetual"],
-            "modes": ["dry_run", "live"],
             "actions": ["cancel_entry", "reduce_half", "close", "detach"],
         }
 
     def _lock(self, group_id):
         return self._locks.setdefault(group_id, asyncio.Lock())
-
-    def _broker(self, group):
-        return self.paper if group["request"]["mode"] == "dry_run" else self.broker
 
     async def preview(self, request):
         if request.entry_expires_at <= self.clock():
@@ -131,14 +125,14 @@ class PositionGroupService:
                 "quote": quote,
                 "current_price": str(quote["current_price"]),
                 "entry_closed": False,
-                "prepared": request.mode == "dry_run",
+                "prepared": False,
                 "recovering": False,
                 "error": None,
                 "close_reason": None,
                 "operation_id": None,
                 "operations": {},
                 "legs": [],
-                "history_exported": request.mode == "dry_run",
+                "history_exported": False,
                 "settlement_pending": False,
             }
             for index, amount in enumerate(quote["leg_quantities"], 1):
@@ -257,7 +251,7 @@ class PositionGroupService:
         order["submission_attempted"] = True
         await self._save(group)
         try:
-            outcome = await self._broker(group).submit(PositionGroupRequest(**group["request"]), dict(order))
+            outcome = await self.broker.submit(PositionGroupRequest(**group["request"]), dict(order))
             if outcome.get("status") == "NOT_SUBMITTED" and outcome.get("attempted") is False:
                 # An explicit adapter acknowledgement before its POST boundary is
                 # safe to retry. A timeout or a process crash never grants this.
@@ -307,7 +301,7 @@ class PositionGroupService:
         order["fills_complete"] = outcome.get("fills_complete", order.get("fills_complete", False))
 
     async def _reconcile(self, group):
-        broker = self._broker(group)
+        broker = self.broker
         request = PositionGroupRequest(**group["request"])
         for leg in group["legs"]:
             for order in self._unfinished(leg):
@@ -339,7 +333,7 @@ class PositionGroupService:
             order["cancel_requested"] = True
             await self._save(group)
             try:
-                self._merge_order(order, await self._broker(group).cancel(request, dict(order)))
+                self._merge_order(order, await self.broker.cancel(request, dict(order)))
             except Exception:
                 order["status"] = "UNKNOWN"
                 logger.exception("Entry cancellation requires reconciliation: %s", order["client_order_id"])
@@ -553,7 +547,7 @@ class PositionGroupService:
                     await self._save(group)
                     snapshot = copy.deepcopy(current)
                     request = PositionGroupRequest(**group["request"])
-                    broker = self._broker(group)
+                    broker = self.broker
                 try:
                     outcome = await broker.settle_fees(request, snapshot)
                 except Exception:
@@ -571,7 +565,7 @@ class PositionGroupService:
                         continue
                     before = (current.get("fees_quote"), current.get("fees_complete"))
                     self._merge_order(current, {**outcome, "status": current["status"]})
-                    if before != (current.get("fees_quote"), current.get("fees_complete")) and request.mode == "live":
+                    if before != (current.get("fees_quote"), current.get("fees_complete")):
                         group["history_exported"] = False
                     self._set_settlement_pending(group)
                     await self._save(group)
@@ -600,10 +594,6 @@ class PositionGroupService:
         await self._save(group)
 
     async def _verify_position(self, group):
-        if group["request"]["mode"] == "dry_run":
-            group["exposure_verified"] = True
-            group["recovering"] = False
-            return
         group["exposure_verified"] = False
         group["risk_snapshot_available"] = False
         try:
@@ -627,7 +617,7 @@ class PositionGroupService:
         if self.clock() >= request.entry_expires_at:
             group["entry_closed"] = True
         try:
-            mark = decimal(await self._broker(group).price(request))
+            mark = decimal(await self.broker.price(request))
             if not mark.is_finite() or mark <= 0:
                 raise ValueError("A fresh positive price is required")
             group["current_price"] = str(mark)
@@ -664,7 +654,7 @@ class PositionGroupService:
         await self._reconcile(group)
         unknown = any(order["status"] in UNKNOWN_ORDERS for leg in group["legs"] for order in self._unfinished(leg))
         await self._verify_position(group)
-        if group.get("recovering") and request.mode == "live":
+        if group.get("recovering"):
             if group.get("recovery_risk_check"):
                 try:
                     await self.risk.verify_live(request, group["quote"].get("position_mode"))
@@ -771,7 +761,7 @@ class PositionGroupService:
         remaining = sum(v["remaining"] for v in values)
         liquidation = quote.get("liquidation_price")
         liquidation_kind = quote.get("liquidation_price_kind", "estimate")
-        if opened and group["request"]["mode"] == "live":
+        if opened:
             snapshot = group.get("position_snapshot", {}) if group.get("risk_snapshot_available") and remaining else {}
             liquidation = snapshot.get("liquidation_price")
             liquidation_kind = "exchange" if liquidation else "unavailable"
@@ -780,7 +770,6 @@ class PositionGroupService:
             "id": group["id"],
             "execution_id": group["id"],
             "status": group["status"],
-            "mode": group["request"]["mode"],
             "current_price": group["current_price"],
             "price_available": group.get("price_available", True),
             "entry_price": str(entry_quote / opened) if opened else quote["entry_price"],
@@ -856,7 +845,6 @@ class PositionGroupService:
         service = self.executor_service
         if (
             service is None
-            or group["request"]["mode"] == "dry_run"
             or (group["status"] in TERMINAL_GROUPS and group.get("history_exported"))
         ):
             return
@@ -894,25 +882,23 @@ class PositionGroupService:
                 not self._unfinished(leg) and self._values(group, leg)["remaining"] == 0 for leg in group["legs"]
             )
         if group["status"] not in TERMINAL_GROUPS:
-            live = group["request"]["mode"] == "live"
             submitted = any(
                 order.get("submission_attempted", order["status"] != "PREPARED")
                 for leg in group["legs"]
                 for order in leg["orders"]
             )
             group["status"] = "RECONCILING"
-            group["recovering"] = live
-            group["recovery_risk_check"] = live and submitted
-            group["exposure_verified"] = not live
-            if live and not submitted:
+            group["recovering"] = True
+            group["recovery_risk_check"] = submitted
+            group["exposure_verified"] = False
+            if not submitted:
                 # Configuration permission expires across process lifetimes. With
                 # no attempted order it is safe to run the idle-symbol preflight.
                 group["prepared"] = False
             for leg in group["legs"]:
                 for order in leg["orders"]:
                     if (
-                        live
-                        and order["status"] not in ("PREPARED", "FAILED")
+                        order["status"] not in ("PREPARED", "FAILED")
                         and not (order["status"] == "CANCELED" and not order.get("submission_attempted", True))
                     ):
                         order["status"] = "UNKNOWN"
