@@ -1,4 +1,5 @@
-"""The optional core compatibility guard reports missing fields and accepts an empty list."""
+"""The core compatibility guard checks the external surface used by managed groups."""
+
 from types import SimpleNamespace
 
 import pytest
@@ -13,9 +14,8 @@ def test_the_installed_core_carries_everything_this_api_reads():
     require_core_surface()
 
 
-def test_the_list_is_empty_because_nothing_extra_is_required_right_now():
-    """The current release does not require a patched or unreleased core."""
-    assert list(REQUIRED_CORE_SURFACE) == []
+def test_the_list_covers_managed_order_transport_and_read_views():
+    assert {attribute for _, attribute, _ in REQUIRED_CORE_SURFACE} >= {"_api_get", "_api_post", "_api_delete", "config"}
 
 
 def test_a_missing_field_is_a_startup_error_naming_it(monkeypatch):

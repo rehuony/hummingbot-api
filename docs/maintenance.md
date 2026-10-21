@@ -43,6 +43,11 @@ There is no tracked lockfile today. Do not invent a lockfile replacement or a pr
 source. Hummingbot core comes from PyPI; other channels and external images remain documented
 in `environment.yml`, `Dockerfile`, and the Compose files.
 
+Managed position groups pin the tested PyPI engine to `hummingbot==20260922` and
+validate their required connector surface at startup. See the
+[group contract and recovery guide](position-groups.md) before changing that pin
+or the group's three persistence tables. Existing executor types remain separate.
+
 `make run` starts local PostgreSQL and EMQX dependencies and runs development uvicorn,
 potentially configuring Tailscale. It is an operational action, not a test command.
 Use mocks and temporary data for tests. Do not verify changes using real trades.

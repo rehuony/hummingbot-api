@@ -3,6 +3,9 @@
 See the [README](../README.md) for installation and routine commands, and
 [maintenance](maintenance.md) for publication, deployment, migration, and recovery.
 
+Trade Cards use the [managed position group API](position-groups.md), including
+two-leg execution, entry TTL, idempotent commands, and restart reconciliation.
+
 ## Services
 
 After hummingbot-api is running, these services are available:

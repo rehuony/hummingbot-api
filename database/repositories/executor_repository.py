@@ -697,7 +697,9 @@ class ExecutorRepository:
             Number of executors cleaned up
         """
         # Find executors that are RUNNING but not in the active list
-        conditions = [ExecutorRecord.status == "RUNNING"]
+        # Managed groups own their recovery and cannot be reaped from an empty
+        # in-memory registry during startup.
+        conditions = [ExecutorRecord.status == "RUNNING", ExecutorRecord.executor_type != "managed_position_executor"]
 
         if active_executor_ids:
             conditions.append(~ExecutorRecord.executor_id.in_(active_executor_ids))

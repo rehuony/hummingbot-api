@@ -43,6 +43,7 @@ from database import (
     GatewaySwapRepository,
 )
 from models.executors import PositionHold
+from services.executors.managed_position import ManagedPositionConfig, ManagedPositionExecutor
 from services.gateway_client import get_native_gas_token
 from services.trading_service import AccountTradingInterface, TradingService
 from utils.executor_log_capture import ExecutorLogCapture, current_executor_id
@@ -131,6 +132,7 @@ class ExecutorService:
 
     # Mapping of executor type strings to (executor_class, config_class)
     EXECUTOR_REGISTRY: Dict[str, tuple[Type[ExecutorBase], Type[ExecutorConfigBase]]] = {
+        "managed_position_executor": (ManagedPositionExecutor, ManagedPositionConfig),
         "position_executor": (PositionExecutor, PositionExecutorConfig),
         "grid_executor": (GridExecutor, GridExecutorConfig),
         "dca_executor": (DCAExecutor, DCAExecutorConfig),
@@ -350,7 +352,7 @@ class ExecutorService:
                 # or remove from _active_executors while this loop is suspended.
                 completed_ids = []
                 for executor_id, executor in list(self._active_executors.items()):
-                    if executor.is_closed:
+                    if executor.is_closed and not isinstance(executor, ManagedPositionExecutor):
                         completed_ids.append(executor_id)
                     elif (
                         self._executor_metadata.get(executor_id, {}).get("executor_type") == "lp_executor"
@@ -884,6 +886,8 @@ class ExecutorService:
         Returns:
             Dictionary with executor_id and initial status
         """
+        if executor_config.get("type") == "managed_position_executor":
+            raise HTTPException(status_code=409, detail="Managed positions must be created through position-groups")
         account = account_name or self.default_account
         trading_interface = self._get_trading_interface(account)
 
@@ -1075,6 +1079,15 @@ class ExecutorService:
             Dictionary with stop confirmation
         """
         executor = self._active_executors.get(executor_id)
+        if isinstance(executor, ManagedPositionExecutor):
+            from models.position_groups import PositionGroupCommand
+            groups = getattr(self, "position_group_service", None)
+            if groups is None:
+                raise HTTPException(503, "Managed position service is unavailable")
+            action = "detach" if keep_position else "close"
+            await groups.command(executor.group["id"], PositionGroupCommand(
+                operation_id=f"executor-{action}-{executor_id}", action=action))
+            return {"executor_id": executor_id, "status": "stopping", "keep_position": keep_position}
         if not executor:
             # Terminal executors are popped from memory within one control-loop tick,
             # so "not in memory" usually means "already terminated", not "unknown".
@@ -1827,9 +1840,11 @@ class ExecutorService:
                     )
                 else:
                     logger.debug(f"Persisted executor {executor_id} completion to database")
+                return record is not None
 
             except Exception as e:
                 logger.error(f"Error persisting executor completion: {e}")
+                return False
 
     # ========================================
     # Position Hold Tracking Methods

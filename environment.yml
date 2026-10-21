@@ -20,9 +20,8 @@ dependencies:
   - docker-py
   - pip
   - pip:
-      # Hummingbot remains the external trading engine. This API currently has no
-      # additional unreleased-core requirements in utils/core_compatibility.py.
-      - hummingbot
+      # Managed orders depend on the tested connector submission/reconciliation surface.
+      - hummingbot==20260922
       - geckoterminal-py>=0.3.1
       - msgpack>=1.0.5
       - flake8

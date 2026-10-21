@@ -59,6 +59,7 @@ from routers import (  # noqa: E402
     market_data,
     performance,
     portfolio,
+    position_groups,
     scripts,
     storage,
     system,
@@ -71,6 +72,10 @@ from services.bots_orchestrator import BotsOrchestrator  # noqa: E402
 from services.docker_service import DockerService  # noqa: E402
 from services.executor_service import ExecutorService  # noqa: E402
 from services.executor_ws_manager import ExecutorWebSocketManager  # noqa: E402
+from services.executors.broker import Broker  # noqa: E402
+from services.executors.groups import PositionGroupService  # noqa: E402
+from services.executors.risk import RiskService  # noqa: E402
+from services.executors.store import PositionGroupStore  # noqa: E402
 from services.gateway_amm_service import GatewayAMMService  # noqa: E402
 from services.gateway_clmm_service import GatewayCLMMService  # noqa: E402
 from services.gateway_service import GatewayService  # noqa: E402
@@ -118,8 +123,7 @@ async def _service_lifespan(app: FastAPI):
     Lifespan context manager for the FastAPI application.
     Handles startup and shutdown events.
     """
-    # Apply the explicit Hummingbot compatibility requirements, if any. The current
-    # requirement list is empty and does not require a patched or unreleased core.
+    # Validate the external engine surface before restoring managed order ledgers.
     require_core_surface()
 
     # SEC-018: warn loudly if USERNAME/PASSWORD/CONFIG_PASSWORD are still the insecure defaults
@@ -341,6 +345,16 @@ async def _service_lifespan(app: FastAPI):
     executor_service.start()
     await executor_service.cleanup_orphaned_executors()
     await executor_service.recover_positions_from_db()
+
+    async def managed_connector(request):
+        # These orders use fresh REST snapshots, not an order-book subscription.
+        # In particular a failed market-data feed must not block cancellation.
+        return await connector_service.get_trading_connector(request.account_name, request.connector_name)
+
+    position_group_service = PositionGroupService(
+        PositionGroupStore(db_manager), RiskService(managed_connector), Broker(managed_connector), executor_service)
+    executor_service.position_group_service = position_group_service
+    await position_group_service.start()
     accounts_service.start()
 
     # =========================================================================
@@ -357,6 +371,7 @@ async def _service_lifespan(app: FastAPI):
     app.state.gateway_clmm_service = gateway_clmm_service
     app.state.gateway_swap_service = gateway_swap_service
     app.state.executor_service = executor_service
+    app.state.position_group_service = position_group_service
     websocket_manager = WebSocketManager(market_data_service)
     app.state.websocket_manager = websocket_manager
 
@@ -384,6 +399,7 @@ async def _service_lifespan(app: FastAPI):
     await executor_ws_manager.shutdown()
     await bots_orchestrator.stop()
     await accounts_service.stop()
+    await position_group_service.stop()
     await executor_service.stop()
     await market_data_service.stop()
     await connector_service.stop_all()
@@ -467,6 +483,7 @@ app.include_router(archived_bots.router, dependencies=[Depends(auth_user)])
 app.include_router(storage.router, dependencies=[Depends(auth_user)])
 app.include_router(system.router, dependencies=[Depends(auth_user)])
 
+app.include_router(position_groups.router, dependencies=[Depends(auth_user)])
 app.include_router(executors.router, dependencies=[Depends(auth_user)])
 
 # WebSocket router (handles its own auth)

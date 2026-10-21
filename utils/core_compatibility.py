@@ -1,15 +1,35 @@
 """Validate explicit compatibility requirements for the external Hummingbot package.
 
-The current requirement list is empty: this API does not require a patched core or an
-unreleased upstream change. Any future requirement must describe a field the API actually
-uses and fail startup with an actionable message when that field is unavailable.
+Managed groups use the tested connector transport and native executor read model.
+No wheel patch or unreleased upstream change is required.
 """
+
 from typing import List, Tuple
 
 # (import path, attribute, what it is for) — each one a field this API reads off the
 # core and cannot substitute.
 REQUIRED_CORE_SURFACE: List[Tuple[str, str, str]] = [
-    # No additional core fields are required beyond the current package interfaces.
+    (
+        "hummingbot.connector.derivative.binance_perpetual.binance_perpetual_derivative:BinancePerpetualDerivative",
+        "_api_get",
+        "authenticated risk and order reconciliation",
+    ),
+    (
+        "hummingbot.connector.derivative.binance_perpetual.binance_perpetual_derivative:BinancePerpetualDerivative",
+        "_api_post",
+        "stable-id order submission",
+    ),
+    (
+        "hummingbot.connector.derivative.binance_perpetual.binance_perpetual_derivative:BinancePerpetualDerivative",
+        "_api_delete",
+        "entry cancellation",
+    ),
+    (
+        "hummingbot.connector.derivative.binance_perpetual.binance_perpetual_derivative:BinancePerpetualDerivative",
+        "exchange_symbol_associated_to_pair",
+        "verified exchange symbol mapping",
+    ),
+    ("hummingbot.strategy_v2.models.executors_info:ExecutorInfo", "config", "managed executor read views"),
 ]
 
 
@@ -41,5 +61,5 @@ def require_core_surface() -> None:
             + "\n".join(missing)
             + f"\n\nInstalled hummingbot: {getattr(hummingbot, '__version__', 'unknown')}. "
             "Install a core that carries these fields (see environment.yml) and rebuild. "
-            "Starting anyway would record every executor's pnl, fees and volume as zero."
+            "Managed execution and reconciliation cannot safely start without this interface."
         )

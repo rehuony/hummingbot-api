@@ -5,6 +5,7 @@ from typing import AsyncGenerator
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from . import position_groups  # noqa: F401 - register managed tables on the shared metadata
 from .models import Base
 
 logger = logging.getLogger(__name__)
