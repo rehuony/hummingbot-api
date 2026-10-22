@@ -179,13 +179,27 @@ async def test_invalid_size_stop_and_expiry_are_refused(request_data, connector,
 
 
 async def test_limit_edge_is_rounded_inside_zone_and_quantity_can_also_close_at_market(request_data, connector):
-    request_data.update(entry_low="100.04", entry_high="100.5")
+    request_data.update(entry_low="99.5", entry_high="99.96")
     connector.data["v1/exchangeInfo"]["symbols"][0]["filters"][1]["stepSize"] = ".03"
     result = await service(connector).quote(request_data)
     assert result["entry_type"] == "LIMIT"
-    assert Decimal(result["entry_price"]) == Decimal("100.1")
+    assert Decimal(result["entry_price"]) == Decimal("99.9")
     assert Decimal(result["leg_quantities"][0]) == Decimal(".48")
     assert Decimal(result["min_base_amount_increment"]) == Decimal(".03")
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"entry_low": "100.04", "entry_high": "100.5"},
+        {"side": "short", "entry_low": "98.5", "entry_high": "99.5", "stop_price": "105", "tp1_price": "95", "tp2_price": "90"},
+    ],
+)
+async def test_price_past_the_zone_toward_the_stop_is_refused_not_filled_at_once(request_data, connector, update):
+    request_data.update(update)
+    with pytest.raises(RiskError) as error:
+        await service(connector).quote(request_data)
+    assert "toward the stop" in error.value.detail
 
 
 @pytest.mark.parametrize("side", ["long", "short"])

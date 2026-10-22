@@ -269,6 +269,11 @@ class RiskService:
             raise RiskError("Price has already passed the stop or first target")
         filters = {row.get("filterType"): row for row in _rows(context["market"].get("filters"), "trading filters")}
         entry_type = "MARKET" if low <= current <= high else "LIMIT"
+        toward_stop = current < low if side == "long" else current > high
+        if toward_stop:
+            # A limit at the zone's far edge would be marketable and fill at once
+            # outside the plan, after the pullback already broke through it.
+            raise RiskError("Price is past the entry zone toward the stop; wait for it to return")
         lot, market_lot = filters.get("LOT_SIZE"), filters.get("MARKET_LOT_SIZE")
         price_filter, notional = filters.get("PRICE_FILTER"), filters.get("MIN_NOTIONAL")
         if not all(isinstance(part, dict) for part in (lot, market_lot, price_filter, notional)):
@@ -285,7 +290,7 @@ class RiskService:
         min_notional = decimal(notional.get("notional"), "minimum notional", positive=True)
         if entry_type == "MARKET":
             entry = current
-        elif current < low:
+        elif side == "short":
             entry = quantize(low, tick, ROUND_CEILING)
         else:
             entry = quantize(high, tick)
