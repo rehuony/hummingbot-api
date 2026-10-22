@@ -3,8 +3,10 @@
 Trade Cards use an API-owned `managed_position_executor`. Existing position, grid,
 order, and LP executors keep their own contracts. A group owns two independently
 accounted legs, one entry intent per leg, and every subsequent reduction order.
-Legs appear in native executor queries and performance under
+Live legs appear in native executor queries and performance under
 `controller_id=trade_cards`, with `level_id=<card_id>:1` and `<card_id>:2`.
+Mock groups remain in the group API and cards; simulated trades never enter
+the real executor performance or position lists.
 
 ## HTTP contract
 
@@ -13,7 +15,7 @@ directly, without a `data` envelope. Decimal quantities and prices are strings.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| GET | `/executors/position-groups/capabilities` | Protocol version, connector and actions |
+| GET | `/executors/position-groups/capabilities` | Protocol version, modes, connector and actions |
 | POST | `/executors/position-groups/preview` | Read-only sizing and risk preview |
 | PUT | `/executors/position-groups/{card_id}` | Reserve and create an idempotent group |
 | GET | `/executors/position-groups/{card_id}` | Durable group and current command snapshot |
@@ -34,6 +36,7 @@ Preview and PUT accept the same flat body:
   "tp2_price": "120",
   "margin": "20",
   "leverage": 10,
+  "mode": "live",
   "entry_expires_at": 2000000000
 }
 ```
@@ -46,9 +49,11 @@ be disabled. Configuration is changed only for an empty symbol and is read back
 before any live entry. A unique database reservation prevents two live groups
 from configuring or entering the same account/connector/symbol concurrently.
 
-Every group trades live; there is no simulated mode, and a request that still
-names a `mode` is rejected. Sizing reads actual account balances, fee rates and
-risk brackets.
+`mode` is `live` (the default when omitted) or `mock`; a stored `dry_run` reads
+as `mock`. Both modes read actual account balances, fee rates and risk brackets.
+Mock uses live mark prices and simulated fills, with an explicit 0.05% simulated
+fee; it never changes leverage/margin settings or submits/cancels an exchange
+order. Mock still requires readable account credentials and valid risk data.
 
 Preview includes `margin`, `notional`, `quantity`, `leg_quantities`,
 `entry_method`, `entry_price`, `max_loss`, `profit_tp1`, `profit_tp2`,
@@ -123,7 +128,8 @@ Startup reloads groups, reconciles submitted order IDs and exchange exposure,
 then resumes their controls. Definite rejections and locally canceled unsent
 intents retain that evidence. An unsubmitted entry repeats its risk preflight;
 groups with previously submitted orders recheck the fixed account settings
-without changing them.
+without changing them. Mock recovery uses its simulated ledger and never
+calls the live account-configuration or order-write methods.
 Exposure is checked during normal operation as well as recovery. Mismatches
 suspend new entries and half reductions and require operator reconciliation;
 known reduce-only exits remain possible when risk/price reads are unavailable.

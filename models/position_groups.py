@@ -20,7 +20,16 @@ class PositionGroupRequest(BaseModel):
     tp2_price: Decimal = Field(gt=0)
     margin: Decimal = Field(gt=0)
     leverage: Literal[10] = 10
+    # Omitted means live, as groups saved before the mode returned were all live.
+    mode: Literal["live", "mock"] = "live"
     entry_expires_at: float = Field(gt=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def legacy_mode(cls, data):
+        if isinstance(data, dict) and data.get("mode") == "dry_run":
+            return {**data, "mode": "mock"}
+        return data
 
     @model_validator(mode="after")
     def price_order(self):
@@ -39,3 +48,9 @@ class PositionGroupCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
     operation_id: str = Field(pattern=r"^[a-zA-Z0-9_-]{1,64}$")
     action: Literal["cancel_entry", "reduce_half", "close", "detach"]
+
+
+def stored_mode(request: dict) -> str:
+    """The mode of a persisted request, which may predate ``mock`` or carry none."""
+    mode = request.get("mode", "live")
+    return "mock" if mode == "dry_run" else mode

@@ -156,6 +156,11 @@ class Broker:
         return Decimal((await self.position_snapshot(request))["amount"])
 
     @staticmethod
+    def _live(request):
+        if value(request, "mode") != "live":
+            raise RiskError("Mock requests cannot submit or cancel exchange orders", 400)
+
+    @staticmethod
     def _unknown(order, status="UNKNOWN"):
         return {
             "status": status,
@@ -199,6 +204,7 @@ class Broker:
         return connector, symbol, data
 
     async def submit(self, request, order):
+        self._live(request)
         try:
             async with asyncio.timeout(REQUEST_TIMEOUT):
                 connector, symbol, data = await self._prepare_submission(request, order)
@@ -246,6 +252,7 @@ class Broker:
         return await self._result(connector, symbol, order, result)
 
     async def cancel(self, request, order):
+        self._live(request)
         connector, symbol = await self._connector(request)
         try:
             async with asyncio.timeout(REQUEST_TIMEOUT):

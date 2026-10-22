@@ -7,6 +7,7 @@ import json
 from sqlalchemy import select
 
 from database.position_groups import ManagedPositionGroup, ManagedPositionLeg, ManagedPositionOperation
+from models.position_groups import stored_mode
 
 
 class RevisionConflict(RuntimeError):
@@ -15,7 +16,7 @@ class RevisionConflict(RuntimeError):
 
 def active_position_key(group):
     request = group["request"]
-    if group["status"] in ("CLOSED", "DETACHED", "FAILED"):
+    if request["mode"] != "live" or group["status"] in ("CLOSED", "DETACHED", "FAILED"):
         return None
     identity = [request[key] for key in ("account_name", "connector_name", "trading_pair")]
     return hashlib.sha256(json.dumps(identity).encode()).hexdigest()
@@ -33,6 +34,7 @@ class PositionGroupStore:
             if record is None:
                 return None
             result = json.loads(record.payload)
+            result["request"]["mode"] = stored_mode(result["request"])
             result["revision"] = record.revision
             result["legs"] = [
                 json.loads(row.checkpoint)

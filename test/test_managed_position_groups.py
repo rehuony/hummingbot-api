@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from database.position_groups import ManagedPositionGroup, ManagedPositionLeg, ManagedPositionOperation
-from models.position_groups import PositionGroupCommand, PositionGroupRequest
+from models.position_groups import PositionGroupCommand, PositionGroupRequest, stored_mode
 from services.executors.groups import PositionGroupService
 from services.executors.managed_position import ManagedPositionConfig, ManagedPositionExecutor, leg_accounting
 from services.executors.store import MemoryPositionGroupStore, PositionGroupStore, RevisionConflict
@@ -32,6 +32,7 @@ def request(**changes):
                 "tp1_price": "110",
                 "tp2_price": "120",
                 "margin": "20",
+                "mode": "live",
                 "entry_expires_at": 1000,
             }
             | changes
@@ -261,6 +262,25 @@ async def test_detach_retains_exposure_and_does_not_close(setup):
     assert result["status"] == "DETACHED"
     assert result["remaining_amount"] == "2"
     assert len(setup.broker.submits) == 2
+
+
+def test_mode_defaults_to_live_and_reads_legacy_dry_run_as_mock():
+    body = request().model_dump()
+    del body["mode"]
+    assert PositionGroupRequest(**body).mode == "live"
+    assert request(mode="dry_run").mode == "mock"
+    assert stored_mode({}) == "live"
+    assert stored_mode({"mode": "dry_run"}) == "mock"
+
+
+@pytest.mark.asyncio
+async def test_mock_never_calls_live_mutations(setup):
+    result = await setup.service.create("card", request(mode="mock"))
+    assert result["status"] == "OPEN"
+    await setup.service.command("card", PositionGroupCommand(operation_id="close", action="close"))
+    assert setup.broker.submits == []
+    assert setup.broker.cancels == []
+    assert setup.risk.prepared == 0
 
 
 @pytest.mark.asyncio
@@ -611,11 +631,13 @@ async def test_delayed_fees_settle_after_closed_without_another_trade(setup):
 
 
 @pytest.mark.asyncio
-async def test_terminal_native_history_export_is_retried(setup):
+async def test_terminal_native_history_export_is_retried_and_mock_is_excluded(setup):
     native = SimpleNamespace(
         _active_executors={}, _executor_metadata={}, _persist_executor_completed=AsyncMock(return_value=False)
     )
     setup.service.executor_service = native
+    await setup.service.create("mock", request(mode="mock"))
+    assert not native._active_executors
     await setup.service.create("card", request())
     await setup.service.command("card", PositionGroupCommand(operation_id="close", action="close"))
     assert "card" in await setup.store.active_ids()
@@ -792,6 +814,27 @@ async def test_existing_exposure_restart_verifies_configuration_without_reconfig
     assert (await restored.get("card"))["error"] == closed["error"]
     setup.risk.prepare_live.assert_not_awaited()
     setup.risk.verify_live.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mock_restart_restores_open_state_and_half_without_live_writes(setup):
+    await setup.service.create("card", request(mode="mock"))
+    setup.risk.prepare_live = AsyncMock(side_effect=AssertionError("Live configuration forbidden"))
+    setup.risk.verify_live = AsyncMock(side_effect=AssertionError("Live recovery forbidden"))
+    setup.broker.submit = AsyncMock(side_effect=AssertionError("Live submission forbidden"))
+    setup.broker.cancel = AsyncMock(side_effect=AssertionError("Live cancel forbidden"))
+    restored = PositionGroupService(setup.store, setup.risk, setup.broker, clock=lambda: setup.clock.now)
+    await restored.start()
+    await restored.stop()
+    await restored._tick_safely(await setup.store.load("card"))
+    assert (await restored.get("card"))["status"] == "OPEN"
+    result = await restored.command("card", PositionGroupCommand(operation_id="mock-half", action="reduce_half"))
+    assert result["remaining_amount"] == "1.0"
+    assert not (await setup.store.load("card"))["recovering"]
+    setup.broker.submit.assert_not_awaited()
+    setup.broker.cancel.assert_not_awaited()
+    setup.risk.prepare_live.assert_not_awaited()
+    setup.risk.verify_live.assert_not_awaited()
 
 
 async def wait_for_status(service, group_id, status):
@@ -1043,12 +1086,3 @@ async def test_restarting_supervisor_does_not_restore_over_an_active_worker(setu
         await wait_for_status(setup.service, "card", "CLOSED")
     finally:
         await setup.service.stop()
-
-
-def test_requests_name_no_execution_mode():
-    """Groups only trade live; a client still sending a mode is refused, not simulated."""
-    from pydantic import ValidationError
-
-    assert "modes" not in PositionGroupService.capabilities()
-    with pytest.raises(ValidationError):
-        PositionGroupRequest(**request().model_dump(mode="json"), mode="live")

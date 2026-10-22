@@ -151,6 +151,8 @@ class RiskService:
         Recovery may already own fills or orders. Never configure the account here;
         a mismatch suspends new entries while the caller preserves known exposure.
         """
+        if value(request, "mode") != "live":
+            raise RiskError("Live risk verification requires a live group", 400)
         if value(request, "connector_name") != "binance_perpetual" or not value(request, "trading_pair").endswith("-USDT"):
             raise RiskError("Managed position groups require Binance USDT perpetuals", 400)
         if value(request, "leverage") != 10:
@@ -346,6 +348,8 @@ class RiskService:
         return self._quote(request, await self._context(request))
 
     async def prepare_live(self, request):
+        if value(request, "mode") != "live":
+            raise RiskError("A mock request cannot configure an exchange account", 400)
         context = await self._context(request)
         self._quote(request, context)  # Reject invalid sizing before any configuration write.
         connector, symbol, config = context["connector"], context["symbol"], context["config"]
