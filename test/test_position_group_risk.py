@@ -202,6 +202,41 @@ async def test_price_past_the_zone_toward_the_stop_is_refused_not_filled_at_once
     assert "toward the stop" in error.value.detail
 
 
+async def test_chosen_leverage_sizes_the_position_and_configures_the_account(request_data, connector):
+    request_data["leverage"] = 15
+    quote = await service(connector).quote(request_data)
+    assert Decimal(quote["total_quantity"]) == Decimal("1.5")
+    assert quote["leverage"] == 15 and quote["configuration_required"] is True
+    await service(connector).prepare_live(request_data)
+    assert connector.writes == [("v1/leverage", {"symbol": "ETHUSDT", "leverage": 15})]
+    request_data["leverage"] = 25
+    with pytest.raises(RiskError) as error:
+        await service(connector).quote(request_data)
+    assert "maximum leverage" in error.value.detail
+
+
+async def test_limits_bound_leverage_by_the_stop_and_margin_by_the_leverage(request_data, connector):
+    del request_data["margin"]
+    limits = await service(connector).limits(request_data)
+    # The symbol allows 20x, but from 19x the liquidation would come before the stop at 95.
+    assert (limits["exchange_max_leverage"], limits["stop_safe_max_leverage"], limits["max_leverage"]) == (20, 18, 18)
+    assert Decimal(limits["min_margin"]) == Decimal("1")  # Two 0.05 legs of 5 USDT at 10x.
+    assert Decimal(limits["max_margin"]) == Decimal("996.01")
+    assert limits["blocked"] is None
+    request_data.update(margin=limits["min_margin"])
+    assert Decimal((await service(connector).quote(request_data))["total_quantity"]) == Decimal("0.1")
+    request_data.update(margin="0.99")
+    with pytest.raises(RiskError):
+        await service(connector).quote(request_data)
+
+
+async def test_limits_stay_visible_while_the_price_is_past_the_zone(request_data, connector):
+    request_data.update(entry_low="100.04", entry_high="100.5")
+    limits = await service(connector).limits(request_data)
+    assert "toward the stop" in limits["blocked"]
+    assert limits["max_leverage"] > 0
+
+
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_liquidation_uses_tier_at_liquidation_not_entry_notional(side):
     brackets = [

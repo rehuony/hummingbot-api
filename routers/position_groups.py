@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Depends, Request
 
-from models.position_groups import PositionGroupCommand, PositionGroupRequest
+from models.position_groups import PositionGroupCommand, PositionGroupLimitsRequest, PositionGroupRequest
 
 router = APIRouter(prefix="/executors/position-groups", tags=["Managed position groups"])
 
@@ -19,6 +19,11 @@ async def capabilities(groups=Depends(service)):
 @router.post("/preview")
 async def preview(body: PositionGroupRequest, groups=Depends(service)):
     return await groups.preview(body)
+
+
+@router.post("/limits")
+async def limits(body: PositionGroupLimitsRequest, groups=Depends(service)):
+    return await groups.limits(body)
 
 
 @router.put("/{group_id}")

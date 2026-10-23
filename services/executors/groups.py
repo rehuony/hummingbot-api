@@ -78,6 +78,8 @@ class PositionGroupService:
             "connectors": ["binance_perpetual"],
             "modes": ["mock", "live"],
             "actions": ["cancel_entry", "reduce_half", "close", "detach"],
+            # Clients that choose leverage or ask for limits require these.
+            "features": ["leverage", "limits"],
         }
 
     def _lock(self, group_id):
@@ -91,6 +93,11 @@ class PositionGroupService:
             raise HTTPException(422, "The entry opportunity has expired")
         quote = await self.risk.quote(request)
         return self._quote_aliases(quote)
+
+    async def limits(self, request):
+        if request.entry_expires_at <= self.clock():
+            raise HTTPException(422, "The entry opportunity has expired")
+        return await self.risk.limits(request)
 
     @staticmethod
     def _quote_aliases(quote):

@@ -102,6 +102,26 @@ def _account_mode(account):
     return "HEDGE" if flag(account.get("dualSidePosition"), "dualSidePosition") else "ONEWAY"
 
 
+def leverage_of(request):
+    """The group's whole-number leverage; persisted requests without one used 10x."""
+    leverage = request.get("leverage", 10) if isinstance(request, dict) else request.leverage
+    if isinstance(leverage, bool) or not isinstance(leverage, int) or leverage < 1:
+        raise RiskError("Leverage must be a whole number of at least 1x", 400)
+    return leverage
+
+
+def _initial_leverage(row):
+    return int(decimal(row.get("initialLeverage"), "maximum leverage", positive=True))
+
+
+def notional_cap(brackets, leverage):
+    """The largest position the user's brackets allow at this leverage (zero if none)."""
+    return max(
+        (decimal(row.get("notionalCap"), "notionalCap", positive=True) for row in brackets if _initial_leverage(row) >= leverage),
+        default=ZERO,
+    )
+
+
 def liquidation_price(side, quantity, entry, collateral, brackets):
     """Solve isolated equity = maintenance margin in the resulting notional tier.
 
@@ -155,8 +175,7 @@ class RiskService:
             raise RiskError("Live risk verification requires a live group", 400)
         if value(request, "connector_name") != "binance_perpetual" or not value(request, "trading_pair").endswith("-USDT"):
             raise RiskError("Managed position groups require Binance USDT perpetuals", 400)
-        if value(request, "leverage") != 10:
-            raise RiskError("Managed position groups require 10x leverage", 400)
+        leverage = leverage_of(request)
         if position_mode not in ("HEDGE", "ONEWAY"):
             raise RiskError("Persisted position mode is unavailable", 502)
         connector, symbol = await self._connector(request)
@@ -166,16 +185,15 @@ class RiskService:
         if _account_mode(account) != position_mode:
             raise RiskError("Exchange position mode differs from the managed group's confirmed mode")
         config = _symbol_config(configs, symbol)
-        if config["marginType"] != "ISOLATED" or decimal(config["leverage"], "leverage", positive=True) != 10:
-            raise RiskError("Exchange did not confirm isolated margin and 10x leverage")
+        if config["marginType"] != "ISOLATED" or decimal(config["leverage"], "leverage", positive=True) != leverage:
+            raise RiskError(f"Exchange did not confirm isolated margin and {leverage}x leverage")
         if flag(config["isAutoAddMargin"], "isAutoAddMargin"):
             raise RiskError("Disable automatic margin addition in Binance before opening a managed group")
 
     async def _context(self, request):
         if value(request, "connector_name") != "binance_perpetual" or not value(request, "trading_pair").endswith("-USDT"):
             raise RiskError("Managed position groups require Binance USDT perpetuals", 400)
-        if value(request, "leverage") != 10:
-            raise RiskError("Managed position groups require 10x leverage", 400)
+        leverage_of(request)
         if value(request, "entry_expires_at") <= self._clock():
             raise RiskError("Trade plan has expired")
         connector, symbol = await self._connector(request)
@@ -257,7 +275,13 @@ class RiskService:
         if _rows(orders, "open orders") or _rows(algo_orders, "conditional orders"):
             raise RiskError("This symbol already has open or conditional orders")
 
-    def _quote(self, request, context):
+    @staticmethod
+    def _terms(request, context):
+        """Plan prices, exchange filters and the entry this price would get.
+
+        ``blocked`` says why the price cannot enter now; the entry is then the
+        zone edge it would wait for, so limits stay visible while it waits.
+        """
         current, mark = context["current"], context["mark"]
         low, high = value(request, "entry_low"), value(request, "entry_high")
         low, high = decimal(low, "entry_low", positive=True), decimal(high, "entry_high", positive=True)
@@ -265,15 +289,14 @@ class RiskService:
         tp1 = decimal(value(request, "tp1_price"), "tp1_price", positive=True)
         tp2 = decimal(value(request, "tp2_price"), "tp2_price", positive=True)
         side = value(request, "side")
+        blocked = None
         if (side == "long" and not stop < mark < tp1) or (side == "short" and not tp1 < mark < stop):
-            raise RiskError("Price has already passed the stop or first target")
-        filters = {row.get("filterType"): row for row in _rows(context["market"].get("filters"), "trading filters")}
-        entry_type = "MARKET" if low <= current <= high else "LIMIT"
-        toward_stop = current < low if side == "long" else current > high
-        if toward_stop:
+            blocked = "Price has already passed the stop or first target"
+        elif current < low if side == "long" else current > high:
             # A limit at the zone's far edge would be marketable and fill at once
             # outside the plan, after the pullback already broke through it.
-            raise RiskError("Price is past the entry zone toward the stop; wait for it to return")
+            blocked = "Price is past the entry zone toward the stop; wait for it to return"
+        filters = {row.get("filterType"): row for row in _rows(context["market"].get("filters"), "trading filters")}
         lot, market_lot = filters.get("LOT_SIZE"), filters.get("MARKET_LOT_SIZE")
         price_filter, notional = filters.get("PRICE_FILTER"), filters.get("MIN_NOTIONAL")
         if not all(isinstance(part, dict) for part in (lot, market_lot, price_filter, notional)):
@@ -284,10 +307,8 @@ class RiskService:
             decimal(lot.get("stepSize"), "quantity step", positive=True),
             decimal(market_lot.get("stepSize"), "market quantity step", positive=True),
         )
-        minimum = max(decimal(item.get("minQty"), "minimum quantity", positive=True) for item in (lot, market_lot))
-        maximum = min(decimal(item.get("maxQty"), "maximum quantity", positive=True) for item in (lot, market_lot))
         tick = decimal(price_filter.get("tickSize"), "price tick", positive=True)
-        min_notional = decimal(notional.get("notional"), "minimum notional", positive=True)
+        entry_type = "MARKET" if low <= current <= high else "LIMIT"
         if entry_type == "MARKET":
             entry = current
         elif side == "short":
@@ -296,27 +317,44 @@ class RiskService:
             entry = quantize(high, tick)
         if entry_type == "LIMIT" and not low <= entry <= high:
             raise RiskError("Entry zone has no price supported by the exchange tick size")
+        return {
+            "side": side,
+            "stop": stop,
+            "tp1": tp1,
+            "tp2": tp2,
+            "current": current,
+            "mark": mark,
+            "entry_type": entry_type,
+            "entry": entry,
+            "blocked": blocked,
+            "step": step,
+            "minimum": max(decimal(item.get("minQty"), "minimum quantity", positive=True) for item in (lot, market_lot)),
+            "maximum": min(decimal(item.get("maxQty"), "maximum quantity", positive=True) for item in (lot, market_lot)),
+            "min_notional": decimal(notional.get("notional"), "minimum notional", positive=True),
+        }
+
+    def _quote(self, request, context):
+        terms = self._terms(request, context)
+        if terms["blocked"]:
+            raise RiskError(terms["blocked"])
+        side, stop, tp1, tp2 = terms["side"], terms["stop"], terms["tp1"], terms["tp2"]
+        current, mark, entry, step = terms["current"], terms["mark"], terms["entry"], terms["step"]
+        leverage = leverage_of(request)
         requested_margin = decimal(value(request, "margin"), "margin", positive=True)
-        leg = quantize(requested_margin * 10 / entry / 2, step)
-        if leg < minimum or leg * min(entry, mark) < min_notional:
+        leg = quantize(requested_margin * leverage / entry / 2, step)
+        if leg < terms["minimum"] or leg * min(entry, mark) < terms["min_notional"]:
             raise RiskError("The selected margin is too small for two valid equal-size legs")
-        if leg > maximum:
+        if leg > terms["maximum"]:
             raise RiskError("Each leg exceeds the exchange maximum order quantity")
         total = leg * 2
-        notional_amount, margin = total * entry, total * entry / 10
-        maximum_notional = max(
-            (
-                decimal(row.get("notionalCap"), "notionalCap", positive=True)
-                for row in context["brackets"]
-                if decimal(row.get("initialLeverage"), "maximum leverage", positive=True) >= 10
-            ),
-            default=ZERO,
-        )
-        if total * max(entry, mark) >= maximum_notional:
-            raise RiskError("Position exceeds the account's 10x leverage risk bracket")
+        notional_amount, margin = total * entry, total * entry / leverage
+        if leverage > max(_initial_leverage(row) for row in context["brackets"]):
+            raise RiskError(f"{leverage}x exceeds this symbol's maximum leverage")
+        if total * max(entry, mark) >= notional_cap(context["brackets"], leverage):
+            raise RiskError(f"Position exceeds the account's {leverage}x leverage risk bracket")
         fee_rate = context["fee_rate"]
         opening_fee = notional_amount * fee_rate
-        if total * max(entry, mark) / 10 + opening_fee > context["available"]:
+        if total * max(entry, mark) / leverage + opening_fee > context["available"]:
             raise RiskError("USDT available balance is insufficient for both legs and estimated entry fees")
         liquidation = liquidation_price(side, total, entry, margin - opening_fee, context["brackets"])
         if (side == "long" and liquidation >= stop) or (side == "short" and liquidation <= stop):
@@ -324,7 +362,7 @@ class RiskService:
         return {
             "total_quantity": str(total),
             "leg_quantities": [str(leg), str(leg)],
-            "entry_type": entry_type,
+            "entry_type": terms["entry_type"],
             "entry_price": str(entry),
             "current_price": str(current),
             "mark_price": str(mark),
@@ -339,15 +377,63 @@ class RiskService:
             "estimated_entry_fees": str(opening_fee),
             "taker_fee_rate": str(fee_rate),
             "min_base_amount_increment": str(step),
-            "min_order_size": str(minimum),
-            "min_notional_size": str(min_notional),
+            "min_order_size": str(terms["minimum"]),
+            "min_notional_size": str(terms["min_notional"]),
             "position_mode": context["position_mode"],
             "margin_mode": "ISOLATED",
-            "leverage": 10,
+            "leverage": leverage,
             "is_auto_add_margin": False,
             "as_of": context["as_of"],
-            "configuration_required": context["config"]["marginType"] != "ISOLATED" or int(context["config"]["leverage"]) != 10,
+            "configuration_required": context["config"]["marginType"] != "ISOLATED"
+            or int(context["config"]["leverage"]) != leverage,
         }
+
+    def _limits(self, request, context):
+        terms = self._terms(request, context)
+        side, stop, entry, mark, step = terms["side"], terms["stop"], terms["entry"], terms["mark"], terms["step"]
+        brackets, fee_rate, available = context["brackets"], context["fee_rate"], context["available"]
+        # The smallest valid leg: what every leverage's minimum margin is built from.
+        leg = max(terms["minimum"], quantize(terms["min_notional"] / min(entry, mark), step, ROUND_CEILING))
+        total = leg * 2
+
+        def stop_safe(leverage):
+            margin = total * entry / leverage
+            try:
+                liquidation = liquidation_price(side, total, entry, margin - total * entry * fee_rate, brackets)
+            except RiskError:
+                return False
+            return liquidation < stop if side == "long" else liquidation > stop
+
+        exchange_max = max(_initial_leverage(row) for row in brackets)
+        safe_max = next((lev for lev in range(exchange_max, 0, -1) if stop_safe(lev)), 0)
+        leverage = leverage_of(request)
+        high = max(entry, mark)
+        # Margin buys leverage × margin / entry of quantity, rounded down to the step.
+        ceilings = [
+            available / (high / entry + leverage * fee_rate),
+            notional_cap(brackets, leverage) * entry / (leverage * high),
+            terms["maximum"] * 2 * entry / leverage,
+        ]
+        cent = Decimal("0.01")
+        return {
+            "leverage": leverage,
+            "max_leverage": min(exchange_max, safe_max),
+            "exchange_max_leverage": exchange_max,
+            "stop_safe_max_leverage": safe_max,
+            "min_margin": str(quantize(total * entry / leverage, cent, ROUND_CEILING)),
+            "max_margin": str(max(quantize(min(ceilings), cent), ZERO)),
+            "available_balance": str(available),
+            "entry_type": terms["entry_type"],
+            "entry_price": str(entry),
+            "current_price": str(terms["current"]),
+            "mark_price": str(mark),
+            "blocked": terms["blocked"],
+            "as_of": context["as_of"],
+        }
+
+    async def limits(self, request):
+        """Leverage range and margin bounds for a plan; reads only, never refuses a price."""
+        return self._limits(request, await self._context(request))
 
     async def quote(self, request):
         return self._quote(request, await self._context(request))
@@ -361,8 +447,9 @@ class RiskService:
         changes = []
         if config["marginType"] != "ISOLATED":
             changes.append(("v1/marginType", {"symbol": symbol, "marginType": "ISOLATED"}))
-        if int(config["leverage"]) != 10:
-            changes.append(("v1/leverage", {"symbol": symbol, "leverage": 10}))
+        leverage = leverage_of(request)
+        if int(config["leverage"]) != leverage:
+            changes.append(("v1/leverage", {"symbol": symbol, "leverage": leverage}))
         for path, data in changes:
             positions, orders, algo_orders = await asyncio.gather(
                 read(connector, "v3/positionRisk", {"symbol": symbol}),
@@ -378,6 +465,6 @@ class RiskService:
             except Exception:
                 raise RiskError(f"Exchange configuration could not be confirmed ({path}); no orders placed", 502) from None
         verified = await self._context(request)
-        if verified["config"]["marginType"] != "ISOLATED" or int(verified["config"]["leverage"]) != 10:
-            raise RiskError("Exchange did not confirm isolated margin and 10x leverage", 502)
+        if verified["config"]["marginType"] != "ISOLATED" or int(verified["config"]["leverage"]) != leverage:
+            raise RiskError(f"Exchange did not confirm isolated margin and {leverage}x leverage", 502)
         return self._quote(request, verified)

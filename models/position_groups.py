@@ -19,7 +19,10 @@ class PositionGroupRequest(BaseModel):
     tp1_price: Decimal = Field(gt=0)
     tp2_price: Decimal = Field(gt=0)
     margin: Decimal = Field(gt=0)
-    leverage: Literal[10] = 10
+    # Omitted means 10x, the only leverage groups saved before it was chosen used.
+    # The symbol's own maximum (up to 150x on Binance) and the stop's liquidation
+    # bound are risk checks; the model only refuses what no symbol allows.
+    leverage: int = Field(default=10, ge=1, le=1000)
     # Omitted means live, as groups saved before the mode returned were all live.
     mode: Literal["live", "mock"] = "live"
     entry_expires_at: float = Field(gt=0)
@@ -42,6 +45,12 @@ class PositionGroupRequest(BaseModel):
         if not valid:
             raise ValueError("stop, entry zone and targets must be ordered in the trade direction")
         return self
+
+
+class PositionGroupLimitsRequest(PositionGroupRequest):
+    """A plan before its amount is chosen: what leverage and margin it allows."""
+
+    margin: Decimal | None = Field(default=None, gt=0)
 
 
 class PositionGroupCommand(BaseModel):
